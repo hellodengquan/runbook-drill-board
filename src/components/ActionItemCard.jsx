@@ -15,13 +15,15 @@ export default function ActionItemCard({
   const daysUntil = getDaysUntilDue(actionItem.dueDate)
 
   const priorityColors = {
-    high: { bg: '#fee2e2', text: '#991b1b' },
+    critical: { bg: '#fee2e2', text: '#991b1b' },
+    high: { bg: '#fed7aa', text: '#9a3412' },
     medium: { bg: '#fef08a', text: '#854d0e' },
     low: { bg: '#dcfce7', text: '#166534' }
   }
 
-  const priorityLabels = { high: '高', medium: '中', low: '低' }
+  const priorityLabels = { critical: '紧急', high: '高', medium: '中', low: '低' }
   const priority = priorityColors[actionItem.priority] || priorityColors.medium
+  const priorityLabel = priorityLabels[actionItem.priority] || priorityLabels.medium
 
   const nextStatus = {
     pending: 'in_progress',
@@ -52,7 +54,7 @@ export default function ActionItemCard({
           className="priority-badge"
           style={{ backgroundColor: priority.bg, color: priority.text }}
         >
-          P{priorityLabels[actionItem.priority]}
+          P{priorityLabel}
         </span>
       </div>
 
