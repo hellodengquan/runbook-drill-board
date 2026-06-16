@@ -1,14 +1,33 @@
 import '@testing-library/jest-dom'
 
-const localStorageMock = {
-  getItem: vi.fn(),
-  setItem: vi.fn(),
-  clear: vi.fn(),
-  removeItem: vi.fn()
+const createLocalStorageMock = () => {
+  const store = new Map()
+  return {
+    getItem: vi.fn((key) => {
+      const v = store.get(key)
+      return v === undefined ? null : v
+    }),
+    setItem: vi.fn((key, value) => {
+      store.set(String(key), String(value))
+    }),
+    removeItem: vi.fn((key) => {
+      store.delete(key)
+    }),
+    clear: vi.fn(() => {
+      store.clear()
+    }),
+    key: vi.fn((index) => {
+      return Array.from(store.keys())[index] || null
+    }),
+    get length() {
+      return store.size
+    },
+    _store: store
+  }
 }
 
 Object.defineProperty(window, 'localStorage', {
-  value: localStorageMock
+  value: createLocalStorageMock()
 })
 
 Object.defineProperty(window, 'matchMedia', {

@@ -232,7 +232,7 @@ describe('helpers utility functions', () => {
       const { nodes } = generateDependencyGraph(mockScenario)
       const scenarioNode = nodes.find((n) => n.type === 'scenario')
       expect(scenarioNode).toBeDefined()
-      expect(scenarioNode.label).toBe('演练场景')
+      expect(scenarioNode.label).toBe(mockScenario.name)
     })
 
     it('should have participant, issue, and action nodes', () => {

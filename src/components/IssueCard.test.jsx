@@ -40,7 +40,7 @@ describe('IssueCard', () => {
 
   it('should display severity badge', () => {
     render(<IssueCard {...defaultProps} />)
-    expect(screen.getByText('高')).toBeInTheDocument()
+    expect(screen.getByText('高危')).toBeInTheDocument()
   })
 
   it('should display root cause category', () => {

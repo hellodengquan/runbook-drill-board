@@ -172,8 +172,8 @@ describe('App Integration Tests', () => {
 
     it('should display scenario details', () => {
       render(<App />)
-      expect(screen.getByText(/预期 SLO:/)).toBeInTheDocument()
-      expect(screen.getByText(/实际 RTO:/)).toBeInTheDocument()
+      expect(screen.getByText(/预期 SLO/)).toBeInTheDocument()
+      expect(screen.getByText(/实际 RTO/)).toBeInTheDocument()
     })
 
     it('should display objectives section', () => {
@@ -205,9 +205,9 @@ describe('App Integration Tests', () => {
 
     it('should display issue severity badges', () => {
       render(<App />)
-      expect(screen.getByText('高')).toBeInTheDocument()
-      expect(screen.getByText('严重')).toBeInTheDocument()
-      expect(screen.getByText('中')).toBeInTheDocument()
+      expect(screen.getByText('高危')).toBeInTheDocument()
+      expect(screen.getByText('致命')).toBeInTheDocument()
+      expect(screen.getByText('中危')).toBeInTheDocument()
     })
 
     it('should display issue root cause badges', () => {

@@ -1,11 +1,25 @@
 import { useState, useEffect, useCallback } from 'react'
-import { saveToStorage, loadFromStorage } from './utils/storage'
-import { syncService, syncStatus, useSync } from './utils/syncApi'
+import { saveToStorage, loadFromStorage, getStorageInfo, getStorageEvictionLog } from './utils/storage'
+import { syncService, syncStatus, conflictResolution, useSync } from './utils/syncApi'
 import {
   formatDate,
   formatDateTime,
   exportMarkdownReport,
-  downloadFile
+  downloadFile,
+  formatSlo,
+  formatRto,
+  isRtoMet,
+  calculateDowntimeFromSlo,
+  createSloComposite,
+  createRtoComposite,
+  createShiftRotation,
+  severityConfig,
+  getEscalationPath,
+  checkSeverityEscalationNeeded,
+  canReopenActionItem,
+  buildActionItemReopenHistory,
+  holidayPriorityLevels,
+  getOnCallPerson
 } from './utils/helpers'
 import ScenarioSidebar from './components/ScenarioSidebar'
 import ParticipantsPanel from './components/ParticipantsPanel'
@@ -26,23 +40,13 @@ const initialData = [
     name: '数据库故障应急演练',
     description: '模拟主数据库宕机，验证故障切换流程和数据恢复能力',
     date: '2026-06-10',
-    expectedSlo: '99.9% 可用性',
-    actualRto: '8 分钟',
+    expectedSlo: createSloComposite(99.9, 30, 'day'),
+    actualRto: createRtoComposite(5, 'minute', 8, 'minute'),
+    updatedAt: '2026-06-10T18:00:00Z',
     objectives: [
-      {
-        id: 'obj1',
-        description: '故障切换时间',
-        target: '5',
-        actual: '8',
-        achieved: false
-      },
-      {
-        id: 'obj2',
-        description: '数据零丢失',
-        target: '0',
-        actual: '0',
-        achieved: true
-      }
+      { id: 'obj1', description: '故障切换时间', target: '5 分钟', actual: '8 分钟', achieved: false },
+      { id: 'obj2', description: '数据零丢失', target: '0 条', actual: '0 条', achieved: true },
+      { id: 'obj3', description: '全员响应时间', target: '<3 分钟', actual: '2.5 分钟', achieved: true }
     ],
     participants: [
       {
@@ -52,7 +56,14 @@ const initialData = [
         department: '运维部',
         shiftSchedule: '主班 9:00-18:00',
         phone: '13800138001',
-        email: 'zhangwei@example.com'
+        email: 'zhangwei@example.com',
+        shiftRotation: createShiftRotation({
+          primary: true,
+          secondary: 'p2',
+          backup: 'p3',
+          holidayPriority: 2,
+          handoffNotes: '节假日24小时待命，保持电话畅通'
+        })
       },
       {
         id: 'p2',
@@ -61,7 +72,14 @@ const initialData = [
         department: 'DBA组',
         shiftSchedule: '备班 18:00-次日9:00',
         phone: '13800138002',
-        email: 'lina@example.com'
+        email: 'lina@example.com',
+        shiftRotation: createShiftRotation({
+          primary: false,
+          secondary: 'p3',
+          backup: 'p1',
+          holidayPriority: 1,
+          handoffNotes: '法定节假日优先值班'
+        })
       },
       {
         id: 'p3',
@@ -70,7 +88,14 @@ const initialData = [
         department: '核心业务组',
         shiftSchedule: '主班 9:00-18:00',
         phone: '13800138003',
-        email: 'wangqiang@example.com'
+        email: 'wangqiang@example.com',
+        shiftRotation: createShiftRotation({
+          primary: false,
+          secondary: 'p1',
+          backup: 'p2',
+          holidayPriority: 3,
+          exceptionDates: ['2026-10-01', '2026-10-02']
+        })
       }
     ],
     issues: [
@@ -86,6 +111,8 @@ const initialData = [
         affectedSystems: '核心交易数据库',
         impact: '影响期间约500笔交易',
         resolution: '',
+        escalationHistory: [],
+        reopenCount: 0,
         createdAt: '2026-06-10T10:30:00Z',
         updatedAt: '2026-06-10T10:30:00Z'
       },
@@ -101,8 +128,12 @@ const initialData = [
         affectedSystems: '监控平台',
         impact: '响应时间增加5分钟',
         resolution: '',
+        escalationHistory: [
+          { from: 'high', to: 'critical', at: '2026-06-10T10:45:00Z', reason: '响应延迟超阈值自动升级' }
+        ],
+        reopenCount: 0,
         createdAt: '2026-06-10T10:35:00Z',
-        updatedAt: '2026-06-10T10:35:00Z'
+        updatedAt: '2026-06-10T10:45:00Z'
       },
       {
         id: 'i3',
@@ -116,6 +147,9 @@ const initialData = [
         affectedSystems: '运维文档系统',
         impact: '',
         resolution: '已补充完整回滚文档，并组织全员培训',
+        escalationHistory: [],
+        reopenCount: 1,
+        reopenHistory: [{ at: '2026-06-11T09:00:00Z', reason: '回滚文档仍有遗漏' }],
         createdAt: '2026-06-10T11:00:00Z',
         updatedAt: '2026-06-12T15:00:00Z'
       }
@@ -131,6 +165,9 @@ const initialData = [
         issueId: 'i1',
         dueDate: '2026-06-20',
         notes: '需要和架构组确认切换方案',
+        reopenCount: 0,
+        reopenHistory: [],
+        lastReopenAt: null,
         createdAt: '2026-06-10T14:00:00Z',
         updatedAt: '2026-06-10T14:00:00Z',
         completedAt: null
@@ -145,6 +182,9 @@ const initialData = [
         issueId: 'i2',
         dueDate: '2026-06-18',
         notes: '考虑接入短信和电话告警',
+        reopenCount: 0,
+        reopenHistory: [],
+        lastReopenAt: null,
         createdAt: '2026-06-10T14:30:00Z',
         updatedAt: '2026-06-10T14:30:00Z',
         completedAt: null
@@ -159,6 +199,9 @@ const initialData = [
         issueId: 'i3',
         dueDate: '2026-06-15',
         notes: '已完成培训，共12人参与',
+        reopenCount: 0,
+        reopenHistory: [],
+        lastReopenAt: null,
         createdAt: '2026-06-10T15:00:00Z',
         updatedAt: '2026-06-12T16:00:00Z',
         completedAt: '2026-06-12T16:00:00Z'
@@ -189,6 +232,15 @@ function App() {
   const [syncState, setSyncState] = useState(syncService.getStatus())
   const [isSyncing, setIsSyncing] = useState(false)
 
+  const [storageInfo, setStorageInfo] = useState(() => getStorageInfo())
+  const [evictionNotice, setEvictionNotice] = useState(null)
+  const [storageBannerVisible, setStorageBannerVisible] = useState(false)
+
+  const [exportFormat, setExportFormat] = useState('standard')
+  const [exportMenuOpen, setExportMenuOpen] = useState(false)
+
+  const [conflictModal, setConflictModal] = useState({ open: false, data: null })
+
   const [modalState, setModalState] = useState({
     scenario: { isOpen: false, data: null },
     participant: { isOpen: false, data: null },
@@ -202,9 +254,27 @@ function App() {
 
   useEffect(() => {
     if (scenarios.length > 0) {
-      saveToStorage(scenarios)
+      const result = saveToStorage(scenarios)
+      if (result?.evicted && result.evicted.length > 0) {
+        setEvictionNotice(result)
+        setStorageBannerVisible(true)
+      }
+      setStorageInfo(getStorageInfo())
     }
   }, [scenarios])
+
+  useEffect(() => {
+    if (syncState.status === syncStatus.CONFLICT && syncState.pendingConflicts > 0) {
+      setConflictModal({ open: true, data: syncState })
+    }
+  }, [syncState.status, syncState.pendingConflicts])
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setStorageInfo(getStorageInfo())
+    }, 10000)
+    return () => clearInterval(interval)
+  }, [])
 
   useEffect(() => {
     let syncTimeout
@@ -233,16 +303,29 @@ function App() {
   const handleSyncNow = async () => {
     if (scenarios.length > 0) {
       setIsSyncing(true)
-      await syncService.push(scenarios)
+      const res = await syncService.push(scenarios)
+      if (res?.conflict) {
+        setConflictModal({ open: true, data: res })
+      }
       setIsSyncing(false)
     }
   }
 
-  const handleExportReport = () => {
+  const handleResolveConflict = async (resolution) => {
+    const result = syncService.resolveConflict(0, resolution)
+    if (result?.success && result.data) {
+      setScenarios(result.data)
+    }
+    setConflictModal({ open: false, data: null })
+  }
+
+  const handleExportReport = (format = exportFormat) => {
     if (!activeScenario) return
-    const markdown = exportMarkdownReport(activeScenario)
-    const filename = `演练复盘-${activeScenario.name}-${new Date().toISOString().split('T')[0]}.md`
+    const markdown = exportMarkdownReport(activeScenario, format)
+    const formatLabel = { standard: 'md', confluence: 'confluence-wiki', notion: 'notion-md' }[format] || 'md'
+    const filename = `演练复盘-${activeScenario.name}-${new Date().toISOString().split('T')[0]}-${formatLabel}.md`
     downloadFile(markdown, filename, 'text/markdown;charset=utf-8')
+    setExportMenuOpen(false)
   }
 
   const handleAddScenario = () => {
@@ -409,19 +492,69 @@ function App() {
   const handleActionItemStatusChange = (actionItemId, newStatus) => {
     const now = new Date().toISOString()
     const isCompleted = newStatus === 'completed' || newStatus === 'verified'
-    updateScenario(activeScenarioId, (scenario) => ({
-      ...scenario,
-      actionItems: scenario.actionItems.map((a) =>
-        a.id === actionItemId
-          ? {
-              ...a,
-              status: newStatus,
-              updatedAt: now,
-              completedAt: isCompleted && !a.completedAt ? now : a.completedAt
+
+    updateScenario(activeScenarioId, (scenario) => {
+      const target = scenario.actionItems.find(a => a.id === actionItemId)
+      if (!target) return scenario
+
+      const wasCompleted = target.status === 'completed' || target.status === 'verified'
+      const isReopening = wasCompleted && !isCompleted
+
+      if (isReopening) {
+        const check = canReopenActionItem(target)
+        if (!check.allowed) {
+          alert(check.reason)
+          return scenario
+        }
+      }
+
+      return {
+        ...scenario,
+        actionItems: scenario.actionItems.map((a) => {
+          if (a.id !== actionItemId) return a
+          const base = {
+            ...a,
+            status: newStatus,
+            updatedAt: now,
+            completedAt: isCompleted && !a.completedAt ? now : (isCompleted ? a.completedAt : null)
+          }
+          if (isReopening) {
+            return {
+              ...base,
+              reopenCount: (a.reopenCount || 0) + 1,
+              lastReopenAt: now,
+              reopenHistory: [...(a.reopenHistory || []), { at: now, reason: '用户手动重开' }]
             }
-          : a
-      )
-    }))
+          }
+          return base
+        })
+      }
+    })
+  }
+
+  const applySeverityAutoEscalation = () => {
+    const now = new Date().toISOString()
+    let changes = 0
+    updateScenario(activeScenarioId, (scenario) => {
+      const updatedIssues = scenario.issues.map(issue => {
+        const esc = checkSeverityEscalationNeeded(issue)
+        if (esc && esc.shouldEscalate) {
+          changes++
+          return {
+            ...issue,
+            severity: esc.toSeverity,
+            updatedAt: now,
+            escalationHistory: [
+              ...(issue.escalationHistory || []),
+              { from: issue.severity, to: esc.toSeverity, at: now, reason: esc.reason, auto: true }
+            ]
+          }
+        }
+        return issue
+      })
+      return { ...scenario, issues: updatedIssues }
+    })
+    return changes
   }
 
   const handleDragStart = (e, issue) => {
@@ -462,8 +595,10 @@ function App() {
   }
 
   const getSyncIcon = () => {
-    if (isSyncing || syncState.status === syncStatus.SYNCING) return '🔄'
-    if (syncState.status === syncStatus.ERROR) return '⚠️'
+    if (syncState.status === syncStatus.OFFLINE || !syncState.isOnline) return '📴'
+    if (syncState.status === syncStatus.RETRYING || isSyncing || syncState.status === syncStatus.SYNCING) return '🔄'
+    if (syncState.status === syncStatus.CONFLICT) return '⚠️'
+    if (syncState.status === syncStatus.ERROR) return '❌'
     if (syncState.status === syncStatus.SUCCESS) return '✅'
     return '☁️'
   }
@@ -504,6 +639,15 @@ function App() {
     ? Math.round((completedActions.length / actionItems.length) * 100)
     : 0
 
+  const sloStr = formatSlo(activeScenario.expectedSlo)
+  const rtoStr = formatRto(activeScenario.actualRto)
+  const rtoMet = isRtoMet(activeScenario.actualRto)
+  const allowedDown = calculateDowntimeFromSlo(activeScenario.expectedSlo)
+
+  const onCallInfo = getOnCallPerson(activeScenario.participants)
+  const storageUsagePct = Math.round(storageInfo.usageRatio * 100)
+  const storageCritical = storageInfo.isNearQuota
+
   return (
     <div className="app">
       <ScenarioSidebar
@@ -516,6 +660,24 @@ function App() {
       />
 
       <main className="main-content">
+        {storageBannerVisible && storageCritical && (
+          <div className={`storage-banner ${storageInfo.isOverQuota ? 'critical' : 'warning'}`}>
+            <span>💾 存储使用 {storageUsagePct}% · {Math.round(storageInfo.usedBytes / 1024)}KB / 剩余 {Math.round(storageInfo.remainingBytes / 1024)}KB</span>
+            {evictionNotice?.evicted?.length > 0 && (
+              <span className="storage-evicted">已自动淘汰 {evictionNotice.evicted.length} 个旧演练</span>
+            )}
+            <button className="close-btn" onClick={() => setStorageBannerVisible(false)}>×</button>
+          </div>
+        )}
+
+        {syncState.status === syncStatus.OFFLINE && (
+          <div className="offline-banner">
+            📴 离线模式
+            {syncState.offlineQueueSize > 0 && ` · ${syncState.offlineQueueSize} 条同步队列待处理`}
+            <button className="small-btn" onClick={() => syncService.flushOfflineQueue()}>立即重试</button>
+          </div>
+        )}
+
         <header className="main-header">
           <div>
             <h1 className="scenario-title">{activeScenario.name}</h1>
@@ -525,33 +687,77 @@ function App() {
                 <span className="meta-desc"> • {activeScenario.description}</span>
               )}
             </p>
-            {(activeScenario.expectedSlo || activeScenario.actualRto) && (
-              <p className="scenario-slo">
-                {activeScenario.expectedSlo && (
-                  <span>🎯 预期 SLO: {activeScenario.expectedSlo}</span>
+            {(sloStr || rtoStr) && (
+              <div className="slo-rto-display">
+                {sloStr && (
+                  <div className={`slo-card ${activeScenario.expectedSlo && typeof activeScenario.expectedSlo === 'object' ? 'composite' : ''}`}>
+                    <div className="slo-title">🎯 预期 SLO</div>
+                    <div className="slo-value">{sloStr}</div>
+                    {allowedDown && <div className="slo-sub">允许停机: {allowedDown}</div>}
+                  </div>
                 )}
-                {activeScenario.actualRto && (
-                  <span>⏱️ 实际 RTO: {activeScenario.actualRto}</span>
+                {rtoStr && (
+                  <div className={`rto-card ${rtoMet != null ? (rtoMet ? 'met' : 'missed') : ''}`}>
+                    <div className="rto-title">⏱️ 实际 RTO</div>
+                    <div className="rto-value">{rtoStr}</div>
+                    {rtoMet != null && (
+                      <div className="rto-sub">{rtoMet ? '✅ 达成目标' : '❌ 未达标'}</div>
+                    )}
+                  </div>
                 )}
-              </p>
+                {onCallInfo?.person && (
+                  <div className="oncall-card" style={{ borderColor: holidayPriorityLevels.find(h => h.level === onCallInfo.priority)?.color }}>
+                    <div className="oncall-title">📞 当前值班（{onCallInfo.priorityLabel}）</div>
+                    <div className="oncall-value">{onCallInfo.person.name}</div>
+                    <div className="oncall-sub">{onCallInfo.person.role} · {onCallInfo.person.phone}</div>
+                  </div>
+                )}
+              </div>
             )}
           </div>
           <div className="header-actions">
+            <div className="storage-mini">
+              <span>💾</span>
+              <div className="storage-bar">
+                <div
+                  className={`storage-bar-fill ${storageCritical ? 'warning' : ''}`}
+                  style={{ width: `${storageUsagePct}%` }}
+                />
+              </div>
+              <span className="storage-pct">{storageUsagePct}%</span>
+            </div>
             <button
-              className="sync-btn"
+              className={`sync-btn ${syncState.status === syncStatus.CONFLICT ? 'conflict' : ''} ${syncState.status === syncStatus.OFFLINE ? 'offline' : ''}`}
               onClick={handleSyncNow}
-              disabled={isSyncing}
-              title={
-                syncState.lastSyncTime
-                  ? `上次同步: ${formatDateTime(syncState.lastSyncTime)}`
-                  : '点击同步'
-              }
+              disabled={isSyncing || syncState.status === syncStatus.RETRYING}
+              title={(
+                syncState.lastSyncTime ? `上次同步: ${formatDateTime(syncState.lastSyncTime)}` : '点击同步'
+              ) + (syncState.offlineQueueSize > 0 ? ` | 离线队列: ${syncState.offlineQueueSize}` : '') + (syncState.retryCount > 0 ? ` | 重试: ${syncState.retryCount}/${5}` : '')}
             >
-              {getSyncIcon()} {isSyncing ? '同步中...' : '同步'}
+              {getSyncIcon()} {isSyncing || syncState.status === syncStatus.RETRYING ? (syncState.retryCount > 1 ? `重试${syncState.retryCount}...` : '同步中...') : (syncState.status === syncStatus.CONFLICT ? '有冲突' : syncState.status === syncStatus.OFFLINE ? '离线' : '同步')}
             </button>
-            <button className="export-btn" onClick={handleExportReport}>
-              📄 导出报告
-            </button>
+            <div className="export-wrap">
+              <button className="export-btn" onClick={() => setExportMenuOpen(v => !v)}>
+                📄 导出报告 ▾
+              </button>
+              {exportMenuOpen && (
+                <div className="export-menu">
+                  {[
+                    { id: 'standard', label: '标准 Markdown', icon: '📝' },
+                    { id: 'confluence', label: 'Confluence Wiki', icon: '📘' },
+                    { id: 'notion', label: 'Notion 格式', icon: '📓' }
+                  ].map(f => (
+                    <button
+                      key={f.id}
+                      className={`export-menu-item ${exportFormat === f.id ? 'active' : ''}`}
+                      onClick={() => { setExportFormat(f.id); handleExportReport(f.id) }}
+                    >
+                      <span>{f.icon}</span> {f.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="stats-bar">
               <div className="stat-item">
                 <span className="stat-label">总计</span>
@@ -750,6 +956,88 @@ function App() {
           onSubmit={handleSaveActionItem}
           onCancel={() => closeModal('actionItem')}
         />
+      </Modal>
+
+      <Modal
+        isOpen={conflictModal.open}
+        onClose={() => setConflictModal({ open: false, data: null })}
+        title={`数据同步冲突 (${syncState.pendingConflicts || 1})`}
+        size="large"
+      >
+        <div className="conflict-modal">
+          <div className="conflict-header">
+            <p className="conflict-desc">
+              ⚠️ 检测到本地与远端数据冲突。远端版本（v{conflictModal.data?.remoteVersion || 0}）
+              在 {conflictModal.data?.conflictDetails?.remoteUpdatedAt ? formatDateTime(conflictModal.data.conflictDetails.remoteUpdatedAt) : '未知时间'}
+              被其他客户端修改。
+            </p>
+            <div className="conflict-stats">
+              <div className="conflict-stat">
+                <div className="conflict-stat-label">本地版本</div>
+                <div className="conflict-stat-value">v{conflictModal.data?.localVersion || syncState.version || 0}</div>
+              </div>
+              <div className="conflict-stat">
+                <div className="conflict-stat-label">远端版本</div>
+                <div className="conflict-stat-value">v{conflictModal.data?.remoteVersion || 0}</div>
+              </div>
+              <div className="conflict-stat">
+                <div className="conflict-stat-label">冲突项</div>
+                <div className="conflict-stat-value">
+                  {conflictModal.data?.conflictDetails?.conflictingFields?.length || '多个'}
+                </div>
+              </div>
+            </div>
+          </div>
+          {conflictModal.data?.conflictDetails?.conflictingFields?.length > 0 && (
+            <div className="conflict-fields-list">
+              <h4>冲突字段明细：</h4>
+              <ul>
+                {conflictModal.data.conflictDetails.conflictingFields.slice(0, 8).map((f, i) => (
+                  <li key={i}>
+                    <span className="field-name">{f.field}</span>
+                    <span className="field-local">本地: {JSON.stringify(f.local).slice(0, 30)}</span>
+                    <span className="field-remote">远端: {JSON.stringify(f.remote).slice(0, 30)}</span>
+                  </li>
+                ))}
+                {conflictModal.data.conflictDetails.conflictingFields.length > 8 && (
+                  <li className="more-field">
+                    ...以及 {conflictModal.data.conflictDetails.conflictingFields.length - 8} 个其他字段
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
+          <div className="conflict-resolutions">
+            <button
+              className="resolution-btn keep-local"
+              onClick={() => handleResolveConflict(conflictResolution.LOCAL_WINS)}
+            >
+              🛡️ 保留本地版本
+              <span className="resolution-sub">覆盖远端所有修改</span>
+            </button>
+            <button
+              className="resolution-btn use-remote"
+              onClick={() => handleResolveConflict(conflictResolution.REMOTE_WINS)}
+            >
+              🌐 使用远端版本
+              <span className="resolution-sub">放弃本地未同步修改</span>
+            </button>
+            <button
+              className="resolution-btn merge primary"
+              onClick={() => handleResolveConflict(conflictResolution.MERGE)}
+            >
+              🔗 智能合并（推荐）
+              <span className="resolution-sub">逐字段合并，保留双方变更</span>
+            </button>
+            <button
+              className="resolution-btn manual"
+              onClick={() => setConflictModal({ open: false, data: null })}
+            >
+              ✏️ 稍后手动处理
+              <span className="resolution-sub">关闭弹窗手动比较</span>
+            </button>
+          </div>
+        </div>
       </Modal>
     </div>
   )

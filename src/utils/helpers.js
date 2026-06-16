@@ -24,12 +24,210 @@ export const formatDateTime = (dateString) => {
   })
 }
 
-export const severityColors = {
-  critical: { bg: '#fee2e2', text: '#991b1b', label: '严重' },
-  high: { bg: '#fed7aa', text: '#9a3412', label: '高' },
-  medium: { bg: '#fef08a', text: '#854d0e', label: '中' },
-  low: { bg: '#dcfce7', text: '#166534', label: '低' }
+/* ============================================
+   SLO / RTO 复合格式
+   ============================================ */
+
+export const timeWindowUnits = [
+  { id: 'minute', label: '分钟', multiplier: 1 },
+  { id: 'hour', label: '小时', multiplier: 60 },
+  { id: 'day', label: '天', multiplier: 1440 },
+  { id: 'week', label: '周', multiplier: 10080 },
+  { id: 'month', label: '月', multiplier: 43200 },
+  { id: 'quarter', label: '季度', multiplier: 129600 },
+  { id: 'year', label: '年', multiplier: 525600 }
+]
+
+export const createSloComposite = (percent = 99.9, windowValue = 30, windowUnit = 'day') => ({
+  percent,
+  windowValue,
+  windowUnit,
+  raw: `${percent}% @ ${windowValue} ${timeWindowUnits.find(u => u.id === windowUnit)?.label || '天'}`
+})
+
+export const createRtoComposite = (targetValue = 5, targetUnit = 'minute', actualValue = null, actualUnit = 'minute') => ({
+  targetValue,
+  targetUnit,
+  actualValue,
+  actualUnit,
+  raw: actualValue != null
+    ? `目标 ${targetValue} ${timeWindowUnits.find(u => u.id === targetUnit)?.label || '分钟'} / 实际 ${actualValue} ${timeWindowUnits.find(u => u.id === actualUnit)?.label || '分钟'}`
+    : `目标 ${targetValue} ${timeWindowUnits.find(u => u.id === targetUnit)?.label || '分钟'}`
+})
+
+export const formatSlo = (slo) => {
+  if (!slo) return ''
+  if (typeof slo === 'string') return slo
+  const unit = timeWindowUnits.find(u => u.id === slo.windowUnit)?.label || '天'
+  return `${slo.percent}% 可用性 (${slo.windowValue} ${unit})`
 }
+
+export const formatRto = (rto) => {
+  if (!rto) return ''
+  if (typeof rto === 'string') return rto
+  const tUnit = timeWindowUnits.find(u => u.id === rto.targetUnit)?.label || '分钟'
+  if (rto.actualValue != null) {
+    const aUnit = timeWindowUnits.find(u => u.id === rto.actualUnit)?.label || '分钟'
+    return `目标 ${rto.targetValue}${tUnit} / 实际 ${rto.actualValue}${aUnit}`
+  }
+  return `目标 ${rto.targetValue}${tUnit}`
+}
+
+export const isRtoMet = (rto) => {
+  if (!rto || typeof rto === 'string' || rto.actualValue == null) return null
+  const tUnit = timeWindowUnits.find(u => u.id === rto.targetUnit)?.multiplier || 1
+  const aUnit = timeWindowUnits.find(u => u.id === rto.actualUnit)?.multiplier || 1
+  return (rto.actualValue * aUnit) <= (rto.targetValue * tUnit)
+}
+
+export const calculateDowntimeFromSlo = (slo) => {
+  if (!slo || typeof slo === 'string') return null
+  const unit = timeWindowUnits.find(u => u.id === slo.windowUnit)?.multiplier || 1440
+  const totalMinutes = slo.windowValue * unit
+  const allowedDowntime = totalMinutes * (1 - slo.percent / 100)
+  if (allowedDowntime < 60) return `${allowedDowntime.toFixed(1)} 分钟`
+  if (allowedDowntime < 1440) return `${(allowedDowntime / 60).toFixed(2)} 小时`
+  return `${(allowedDowntime / 1440).toFixed(2)} 天`
+}
+
+/* ============================================
+   Severity 升级 / 降级 阈值路径
+   ============================================ */
+
+export const severityConfig = {
+  critical: {
+    label: '致命',
+    bg: '#fee2e2',
+    text: '#991b1b',
+    level: 4,
+    dotColor: '#dc2626',
+    escalation: {
+      conditions: [
+        { type: 'time', threshold: 30, unit: 'minute', description: '30分钟未响应自动升级' },
+        { type: 'impact', threshold: 1000, description: '影响用户超1000升级' }
+      ],
+      next: null,
+      contact: ['CxO', 'VP of Engineering']
+    },
+    deescalation: {
+      conditions: [
+        { type: 'status', to: 'resolved', description: '解决后可降级' }
+      ],
+      prev: 'high'
+    }
+  },
+  high: {
+    label: '高危',
+    bg: '#fed7aa',
+    text: '#9a3412',
+    level: 3,
+    dotColor: '#f97316',
+    escalation: {
+      conditions: [
+        { type: 'time', threshold: 60, unit: 'minute', description: '1小时未处理升级到致命' },
+        { type: 'impact', threshold: 500, description: '影响范围扩大升级' }
+      ],
+      next: 'critical',
+      contact: ['Engineering Director', 'On-call Lead']
+    },
+    deescalation: {
+      conditions: [
+        { type: 'time_workaround', threshold: 4, unit: 'hour', description: '临时方案生效4小时后可降级' }
+      ],
+      prev: 'medium'
+    }
+  },
+  medium: {
+    label: '中危',
+    bg: '#fef08a',
+    text: '#854d0e',
+    level: 2,
+    dotColor: '#eab308',
+    escalation: {
+      conditions: [
+        { type: 'time', threshold: 4, unit: 'hour', description: '4小时无进展升级到高危' },
+        { type: 'reopen_count', threshold: 2, description: '同一问题重开2次升级' }
+      ],
+      next: 'high',
+      contact: ['Team Lead', 'Senior Engineer']
+    },
+    deescalation: {
+      conditions: [
+        { type: 'status', to: 'resolved', description: '解决后可降级' }
+      ],
+      prev: 'low'
+    }
+  },
+  low: {
+    label: '低危',
+    bg: '#dcfce7',
+    text: '#166534',
+    level: 1,
+    dotColor: '#22c55e',
+    escalation: {
+      conditions: [
+        { type: 'time', threshold: 24, unit: 'hour', description: '24小时未修复升级到中危' },
+        { type: 'issue_count', threshold: 5, description: '关联5个以上同类问题升级' }
+      ],
+      next: 'medium',
+      contact: ['Engineer']
+    },
+    deescalation: {
+      conditions: [],
+      prev: null
+    }
+  }
+}
+
+export const severityColors = Object.fromEntries(
+  Object.entries(severityConfig).map(([k, v]) => [k, { bg: v.bg, text: v.text, label: v.label }])
+)
+
+export const getEscalationPath = (severity) => {
+  const path = []
+  let current = severity
+  while (current) {
+    path.push(current)
+    current = severityConfig[current]?.escalation?.next
+  }
+  return path
+}
+
+export const getDeescalationPath = (severity) => {
+  const path = []
+  let current = severity
+  while (current) {
+    path.push(current)
+    current = severityConfig[current]?.deescalation?.prev
+  }
+  return path
+}
+
+export const checkSeverityEscalationNeeded = (issue) => {
+  const config = severityConfig[issue.severity]
+  if (!config?.escalation?.next) return null
+
+  const elapsed = issue.createdAt ? (Date.now() - new Date(issue.createdAt).getTime()) / 60000 : 0
+
+  for (const condition of config.escalation.conditions) {
+    if (condition.type === 'time') {
+      const multiplier = timeWindowUnits.find(u => u.id === condition.unit)?.multiplier || 1
+      if (elapsed >= condition.threshold * multiplier) {
+        return {
+          shouldEscalate: true,
+          toSeverity: config.escalation.next,
+          reason: condition.description,
+          condition
+        }
+      }
+    }
+  }
+  return null
+}
+
+/* ============================================
+   状态配置
+   ============================================ */
 
 export const statusConfig = {
   todo: { label: '待处理', color: '#6b7280' },
@@ -43,6 +241,100 @@ export const actionItemStatusConfig = {
   blocked: { label: '已阻塞', color: '#dc2626' },
   completed: { label: '已完成', color: '#16a34a' },
   verified: { label: '已验证', color: '#7c3aed' }
+}
+
+/* ============================================
+   Action Item Reopen 限制
+   ============================================ */
+
+export const ACTION_ITEM_REOPEN_CONFIG = {
+  maxReopens: 3,
+  cooldownMinutes: 30,
+  autoBlockThreshold: 2
+}
+
+export const canReopenActionItem = (actionItem) => {
+  if (!actionItem) return { allowed: false, reason: 'Action Item 不存在' }
+
+  const reopenCount = actionItem.reopenCount || 0
+  const lastReopenAt = actionItem.lastReopenAt
+  const now = Date.now()
+
+  if (reopenCount >= ACTION_ITEM_REOPEN_CONFIG.maxReopens) {
+    return {
+      allowed: false,
+      reason: `已达最大重开次数 (${ACTION_ITEM_REOPEN_CONFIG.maxReopens}次)，请升级处理流程`
+    }
+  }
+
+  if (lastReopenAt) {
+    const elapsed = (now - new Date(lastReopenAt).getTime()) / 60000
+    if (elapsed < ACTION_ITEM_REOPEN_CONFIG.cooldownMinutes) {
+      const remaining = Math.ceil(ACTION_ITEM_REOPEN_CONFIG.cooldownMinutes - elapsed)
+      return {
+        allowed: false,
+        reason: `冷却期内，请 ${remaining} 分钟后再尝试，或联系主管审批`
+      }
+    }
+  }
+
+  return { allowed: true }
+}
+
+export const buildActionItemReopenHistory = (actionItem) => {
+  const history = actionItem.reopenHistory || []
+  return {
+    count: actionItem.reopenCount || 0,
+    history,
+    exceedsAutoBlockThreshold: (actionItem.reopenCount || 0) >= ACTION_ITEM_REOPEN_CONFIG.autoBlockThreshold
+  }
+}
+
+/* ============================================
+   Role Rotation 节假日替班优先级
+   ============================================ */
+
+export const holidayPriorityLevels = [
+  { level: 1, label: '一级应急', color: '#dc2626', description: '法定节假日+业务高峰' },
+  { level: 2, label: '二级应急', color: '#f97316', description: '法定节假日' },
+  { level: 3, label: '三级应急', color: '#eab308', description: '周末' },
+  { level: 4, label: '常规值班', color: '#6b7280', description: '工作日' }
+]
+
+export const createShiftRotation = (opts = {}) => ({
+  primary: opts.primary || null,
+  secondary: opts.secondary || null,
+  backup: opts.backup || null,
+  holidayPriority: opts.holidayPriority || 4,
+  exceptionDates: opts.exceptionDates || [],
+  handoffNotes: opts.handoffNotes || ''
+})
+
+export const getOnCallPerson = (participants, date = new Date()) => {
+  const dayOfWeek = date.getDay()
+  const isWeekend = dayOfWeek === 0 || dayOfWeek === 6
+
+  let priority = 4
+  if (isWeekend) priority = 3
+
+  const sorted = [...participants].sort((a, b) => {
+    const pa = a.shiftRotation?.holidayPriority || 4
+    const pb = b.shiftRotation?.holidayPriority || 4
+    return pa - pb
+  })
+
+  const firstEligible = sorted.find(p => {
+    const rotation = p.shiftRotation
+    if (!rotation) return true
+    if (rotation.exceptionDates?.includes(date.toISOString().split('T')[0])) return false
+    return true
+  })
+
+  return {
+    person: firstEligible || sorted[0],
+    priority,
+    priorityLabel: holidayPriorityLevels.find(h => h.level === priority)?.label
+  }
 }
 
 export const rootCauseCategories = [
@@ -92,6 +384,10 @@ export const calculateRto = (startTime, endTime) => {
   return mins > 0 ? `${hours} 小时 ${mins} 分钟` : `${hours} 小时`
 }
 
+/* ============================================
+   Timeline 事件
+   ============================================ */
+
 export const generateTimelineEvents = (scenario) => {
   const events = []
 
@@ -118,6 +414,18 @@ export const generateTimelineEvents = (scenario) => {
         severity: issue.severity,
         issueId: issue.id
       })
+      if (issue.escalationHistory?.length > 0) {
+        issue.escalationHistory.forEach((e, i) => {
+          events.push({
+            id: `${issue.id}-escalation-${i}`,
+            time: e.at,
+            title: `严重度变更: ${e.from} → ${e.to}`,
+            description: e.reason || '严重度调整',
+            type: 'escalation',
+            issueId: issue.id
+          })
+        })
+      }
     })
 
   scenario.actionItems
@@ -133,6 +441,18 @@ export const generateTimelineEvents = (scenario) => {
         status: action.status,
         actionId: action.id
       })
+      if (action.reopenHistory?.length > 0) {
+        action.reopenHistory.forEach((r, i) => {
+          events.push({
+            id: `${action.id}-reopen-${i}`,
+            time: r.at,
+            title: `Action 重开 #${i + 1}`,
+            description: r.reason || '任务重新打开',
+            type: 'reopen',
+            actionId: action.id
+          })
+        })
+      }
     })
 
   scenario.actionItems
@@ -149,114 +469,290 @@ export const generateTimelineEvents = (scenario) => {
   return events.sort((a, b) => new Date(a.time) - new Date(b.time))
 }
 
-export const generateDependencyGraph = (scenario) => {
-  const nodes = []
-  const links = []
+/* ============================================
+   Dependency Graph 性能优化 - 分层布局 + 聚合
+   ============================================ */
 
-  nodes.push({
+const LAYER_CONFIG = {
+  scenario: { layer: 0, nodeWidth: 140, nodeHeight: 48 },
+  participant: { layer: 1, nodeWidth: 110, nodeHeight: 44 },
+  issue: { layer: 2, nodeWidth: 130, nodeHeight: 44 },
+  action: { layer: 3, nodeWidth: 120, nodeHeight: 44 }
+}
+
+const LAYER_X_GAP = 180
+const NODE_Y_GAP = 70
+const CLUSTER_THRESHOLD = 50
+
+export const generateDependencyGraph = (scenario, options = {}) => {
+  const enableOptimization = options.enableOptimization !== false
+  const rawNodes = []
+  const rawLinks = []
+
+  rawNodes.push({
     id: 'scenario',
-    label: '演练场景',
+    label: scenario.name?.substring(0, 14) || '演练场景',
+    fullLabel: scenario.name || '演练场景',
     type: 'scenario',
-    x: 250,
-    y: 50
+    layer: 0
   })
 
-  scenario.participants.forEach((p, i) => {
-    nodes.push({
+  scenario.participants.forEach((p) => {
+    rawNodes.push({
       id: `participant-${p.id}`,
       label: p.name,
+      fullLabel: `${p.name} (${p.role || ''})`,
       type: 'participant',
       role: p.role,
-      x: 80 + (i % 3) * 150,
-      y: 140
+      layer: 1
     })
-    links.push({
-      source: 'scenario',
-      target: `participant-${p.id}`,
-      type: 'participation'
-    })
+    rawLinks.push({ source: 'scenario', target: `participant-${p.id}`, type: 'participation' })
   })
 
-  scenario.issues.forEach((issue, i) => {
-    nodes.push({
+  scenario.issues.forEach((issue) => {
+    rawNodes.push({
       id: `issue-${issue.id}`,
       label: issue.title.substring(0, 15) + (issue.title.length > 15 ? '...' : ''),
+      fullLabel: issue.title,
       type: 'issue',
       severity: issue.severity,
       status: issue.status,
-      x: 80 + (i % 4) * 120,
-      y: 260
+      layer: 2
     })
     if (issue.assigneeId) {
-      links.push({
-        source: `participant-${issue.assigneeId}`,
-        target: `issue-${issue.id}`,
-        type: 'assignment'
-      })
+      rawLinks.push({ source: `participant-${issue.assigneeId}`, target: `issue-${issue.id}`, type: 'assignment' })
     } else {
-      links.push({
-        source: 'scenario',
-        target: `issue-${issue.id}`,
-        type: 'issue'
-      })
+      rawLinks.push({ source: 'scenario', target: `issue-${issue.id}`, type: 'issue' })
     }
   })
 
-  scenario.actionItems.forEach((action, i) => {
-    nodes.push({
+  scenario.actionItems.forEach((action) => {
+    rawNodes.push({
       id: `action-${action.id}`,
       label: action.title.substring(0, 15) + (action.title.length > 15 ? '...' : ''),
+      fullLabel: action.title,
       type: 'action',
       status: action.status,
-      x: 80 + (i % 4) * 120,
-      y: 380
+      layer: 3
     })
     if (action.issueId) {
-      links.push({
-        source: `issue-${action.issueId}`,
-        target: `action-${action.id}`,
-        type: 'action-item'
-      })
+      rawLinks.push({ source: `issue-${action.issueId}`, target: `action-${action.id}`, type: 'action-item' })
     } else {
-      links.push({
-        source: 'scenario',
-        target: `action-${action.id}`,
-        type: 'action'
-      })
+      rawLinks.push({ source: 'scenario', target: `action-${action.id}`, type: 'action' })
     }
     if (action.assigneeId) {
-      links.push({
-        source: `participant-${action.assigneeId}`,
-        target: `action-${action.id}`,
-        type: 'ownership'
-      })
+      rawLinks.push({ source: `participant-${action.assigneeId}`, target: `action-${action.id}`, type: 'ownership' })
     }
   })
 
-  return { nodes, links }
+  const totalNodes = rawNodes.length
+  const shouldCluster = enableOptimization && totalNodes > CLUSTER_THRESHOLD
+
+  if (shouldCluster) {
+    return buildClusteredGraph(rawNodes, rawLinks)
+  }
+
+  return buildLayeredGraph(rawNodes, rawLinks)
 }
 
-export const exportMarkdownReport = (scenario) => {
+const buildLayeredGraph = (rawNodes, rawLinks) => {
+  const nodesByLayer = {}
+  rawNodes.forEach(n => {
+    if (!nodesByLayer[n.layer]) nodesByLayer[n.layer] = []
+    nodesByLayer[n.layer].push(n)
+  })
+
+  const maxLayerCount = Math.max(...Object.values(nodesByLayer).map(l => l.length))
+  const svgWidth = (Object.keys(nodesByLayer).length) * LAYER_X_GAP + 120
+  const svgHeight = maxLayerCount * NODE_Y_GAP + 120
+
+  const nodes = rawNodes.map(node => {
+    const layerNodes = nodesByLayer[node.layer]
+    const indexInLayer = layerNodes.indexOf(node)
+    const totalInLayer = layerNodes.length
+    const xBase = 80 + node.layer * LAYER_X_GAP
+    const yStart = (svgHeight - (totalInLayer * NODE_Y_GAP)) / 2 + NODE_Y_GAP / 2
+    return {
+      ...node,
+      x: xBase,
+      y: yStart + indexInLayer * NODE_Y_GAP,
+      config: LAYER_CONFIG[node.type]
+    }
+  })
+
+  const nodeLookup = Object.fromEntries(nodes.map(n => [n.id, n]))
+  const links = rawLinks
+    .filter(l => nodeLookup[l.source] && nodeLookup[l.target])
+    .map(l => ({ ...l }))
+
+  return {
+    nodes,
+    links,
+    svgWidth,
+    svgHeight,
+    clustered: false,
+    stats: { total: nodes.length, links: links.length }
+  }
+}
+
+const buildClusteredGraph = (rawNodes, rawLinks) => {
+  const clusters = {}
+
+  rawNodes.forEach(node => {
+    const clusterKey = node.type
+    if (!clusters[clusterKey]) {
+      clusters[clusterKey] = {
+        id: `cluster-${clusterKey}`,
+        type: 'cluster',
+        subType: clusterKey,
+        count: 0,
+        children: [],
+        label: getClusterLabel(clusterKey),
+        layer: LAYER_CONFIG[clusterKey]?.layer || 0
+      }
+    }
+    clusters[clusterKey].count++
+    clusters[clusterKey].children.push(node)
+  })
+
+  const clusterNodes = Object.values(clusters)
+  const maxLayerCount = Math.max(1, clusterNodes.length)
+  const svgWidth = 5 * LAYER_X_GAP
+  const svgHeight = Math.max(450, maxLayerCount * NODE_Y_GAP + 120)
+
+  const layerToClusters = {}
+  clusterNodes.forEach(c => {
+    if (!layerToClusters[c.layer]) layerToClusters[c.layer] = []
+    layerToClusters[c.layer].push(c)
+  })
+
+  const nodes = clusterNodes.map((cluster, i) => {
+    const layerClusters = layerToClusters[cluster.layer] || [cluster]
+    const indexInLayer = layerClusters.indexOf(cluster)
+    const totalInLayer = layerClusters.length
+    const xBase = 80 + cluster.layer * LAYER_X_GAP
+    const yStart = (svgHeight - (totalInLayer * (NODE_Y_GAP + 40))) / 2 + NODE_Y_GAP / 2
+    return {
+      id: cluster.id,
+      label: `${cluster.label} (${cluster.count})`,
+      fullLabel: `${cluster.label}集合: ${cluster.count} 个节点`,
+      type: 'cluster',
+      subType: cluster.subType,
+      cluster,
+      layer: cluster.layer,
+      x: xBase,
+      y: yStart + indexInLayer * (NODE_Y_GAP + 40),
+      config: { nodeWidth: 160, nodeHeight: 60 }
+    }
+  })
+
+  const typeOrder = ['scenario', 'participant', 'issue', 'action']
+  const links = []
+  for (let i = 0; i < typeOrder.length - 1; i++) {
+    const srcType = typeOrder[i]
+    const tgtType = typeOrder[i + 1]
+    if (clusters[srcType] && clusters[tgtType]) {
+      const crossLinks = rawLinks.filter(l => {
+        const s = rawNodes.find(n => n.id === l.source)
+        const t = rawNodes.find(n => n.id === l.target)
+        return s?.type === srcType && t?.type === tgtType
+      })
+      if (crossLinks.length > 0) {
+        links.push({
+          source: `cluster-${srcType}`,
+          target: `cluster-${tgtType}`,
+          type: 'cluster-link',
+          count: crossLinks.length
+        })
+      }
+    }
+  }
+
+  return {
+    nodes,
+    links,
+    svgWidth,
+    svgHeight,
+    clustered: true,
+    stats: {
+      total: rawNodes.length,
+      displayed: nodes.length,
+      links: rawLinks.length,
+      displayedLinks: links.length
+    },
+    clusters
+  }
+}
+
+const getClusterLabel = (type) => {
+  const map = { scenario: '演练', participant: '人员组', issue: '问题组', action: 'Action组' }
+  return map[type] || type
+}
+
+/* ============================================
+   Markdown 导出 (标准 / Confluence / Notion)
+   ============================================ */
+
+const buildReportSections = (scenario) => {
+  const sections = {
+    overview: {
+      title: scenario.name,
+      date: formatDate(scenario.date),
+      description: scenario.description || ''
+    },
+    objectives: scenario.objectives || [],
+    slo: scenario.expectedSlo,
+    rto: scenario.actualRto,
+    participants: scenario.participants || [],
+    issues: scenario.issues || [],
+    todoIssues: (scenario.issues || []).filter(i => i.status === 'todo'),
+    inProgressIssues: (scenario.issues || []).filter(i => i.status === 'in_progress'),
+    resolvedIssues: (scenario.issues || []).filter(i => i.status === 'resolved'),
+    actionItems: scenario.actionItems || []
+  }
+  sections.rootCauseCounts = {}
+  scenario.issues.forEach(issue => {
+    if (issue.rootCause) {
+      sections.rootCauseCounts[issue.rootCause] = (sections.rootCauseCounts[issue.rootCause] || 0) + 1
+    }
+  })
+  sections.completedActions = sections.actionItems.filter(a => a.status === 'completed' || a.status === 'verified')
+  return sections
+}
+
+const getAssignee = (participants, id) => participants.find(p => p.id === id)?.name || '-'
+
+export const exportMarkdownReport = (scenario, format = 'standard') => {
+  const s = buildReportSections(scenario)
+
+  switch (format) {
+    case 'confluence':
+      return exportConfluenceReport(scenario, s)
+    case 'notion':
+      return exportNotionReport(scenario, s)
+    default:
+      return exportStandardMarkdown(scenario, s)
+  }
+}
+
+const exportStandardMarkdown = (scenario, s) => {
   const lines = []
-
-  lines.push(`# 应急演练复盘报告: ${scenario.name}`)
+  lines.push(`# 应急演练复盘报告: ${s.overview.title}`)
   lines.push('')
-  lines.push(`**演练日期**: ${formatDate(scenario.date)}`)
+  lines.push(`**演练日期**: ${s.overview.date}`)
   lines.push('')
 
-  if (scenario.description) {
+  if (s.overview.description) {
     lines.push('## 演练概述')
-    lines.push(scenario.description)
+    lines.push(s.overview.description)
     lines.push('')
   }
 
-  if (scenario.objectives?.length > 0) {
+  if (s.objectives.length > 0) {
     lines.push('## 演练目标')
-    scenario.objectives.forEach((obj, i) => {
+    s.objectives.forEach((obj, i) => {
       lines.push(`${i + 1}. ${obj.description}`)
-      if (obj.target) {
-        lines.push(`   - 目标值: ${obj.target}`)
-      }
+      if (obj.target) lines.push(`   - 目标值: ${obj.target}`)
       if (obj.actual != null) {
         lines.push(`   - 实际值: ${obj.actual}`)
         lines.push(`   - 达成状态: ${obj.achieved ? '✅ 已达成' : '❌ 未达成'}`)
@@ -265,124 +761,259 @@ export const exportMarkdownReport = (scenario) => {
     lines.push('')
   }
 
-  if (scenario.expectedSlo || scenario.actualRto) {
+  if (s.slo || s.rto) {
     lines.push('## SLO 与 RTO')
-    if (scenario.expectedSlo) {
-      lines.push(`- **预期 SLO**: ${scenario.expectedSlo}`)
-    }
-    if (scenario.actualRto) {
-      lines.push(`- **实际 RTO**: ${scenario.actualRto}`)
+    if (s.slo) lines.push(`- **预期 SLO**: ${typeof s.slo === 'string' ? s.slo : formatSlo(s.slo)}`)
+    if (s.rto) {
+      const rtoStr = typeof s.rto === 'string' ? s.rto : formatRto(s.rto)
+      const met = isRtoMet(s.rto)
+      const metStr = met != null ? (met ? ' ✅ 达成' : ' ❌ 未达成') : ''
+      lines.push(`- **实际 RTO**: ${rtoStr}${metStr}`)
     }
     lines.push('')
   }
 
   lines.push('## 参演人员')
   lines.push('')
-  lines.push('| 姓名 | 角色 | 部门 | 值班安排 |')
-  lines.push('|------|------|------|----------|')
-  scenario.participants.forEach((p) => {
+  lines.push('| 姓名 | 角色 | 部门 | 值班安排 | 节假日优先级 |')
+  lines.push('|------|------|------|----------|-------------|')
+  s.participants.forEach(p => {
     const shift = p.shiftSchedule || '-'
-    lines.push(`| ${p.name} | ${p.role || '-'} | ${p.department || '-'} | ${shift} |`)
+    const hp = p.shiftRotation?.holidayPriority
+    const hpLabel = hp ? holidayPriorityLevels.find(h => h.level === hp)?.label || '常规' : '常规'
+    lines.push(`| ${p.name} | ${p.role || '-'} | ${p.department || '-'} | ${shift} | ${hpLabel} |`)
   })
   lines.push('')
 
-  const todoIssues = scenario.issues.filter((i) => i.status === 'todo')
-  const inProgressIssues = scenario.issues.filter((i) => i.status === 'in_progress')
-  const resolvedIssues = scenario.issues.filter((i) => i.status === 'resolved')
-
   lines.push('## 问题统计')
   lines.push('')
-  lines.push(`- 总计: ${scenario.issues.length} 个问题`)
-  lines.push(`- 待处理: ${todoIssues.length} 个`)
-  lines.push(`- 处理中: ${inProgressIssues.length} 个`)
-  lines.push(`- 已解决: ${resolvedIssues.length} 个`)
-  lines.push(`- 解决率: ${scenario.issues.length > 0 ? Math.round((resolvedIssues.length / scenario.issues.length) * 100) : 0}%`)
+  lines.push(`- 总计: ${s.issues.length} 个问题`)
+  lines.push(`- 待处理: ${s.todoIssues.length} 个`)
+  lines.push(`- 处理中: ${s.inProgressIssues.length} 个`)
+  lines.push(`- 已解决: ${s.resolvedIssues.length} 个`)
+  lines.push(`- 解决率: ${s.issues.length > 0 ? Math.round((s.resolvedIssues.length / s.issues.length) * 100) : 0}%`)
   lines.push('')
 
-  if (todoIssues.length > 0) {
+  if (s.todoIssues.length > 0) {
     lines.push('### 待处理问题')
     lines.push('')
-    lines.push('| 严重程度 | 问题 | 责任人 | 截止日期 |')
-    lines.push('|----------|------|--------|----------|')
-    todoIssues.forEach((issue) => {
-      const assignee = scenario.participants.find((p) => p.id === issue.assigneeId)
-      const severity = severityColors[issue.severity]?.label || issue.severity
+    lines.push('| 严重程度 | 问题 | 责任人 | 截止日期 | 升级路径 |')
+    lines.push('|----------|------|--------|----------|----------|')
+    s.todoIssues.forEach(issue => {
+      const severity = severityConfig[issue.severity]?.label || issue.severity
       const dueDate = issue.dueDate ? formatDate(issue.dueDate) : '-'
-      lines.push(`| ${severity} | ${issue.title} | ${assignee?.name || '-'} | ${dueDate} |`)
+      const esc = getEscalationPath(issue.severity).map(s2 => severityConfig[s2]?.label).join(' → ')
+      lines.push(`| ${severity} | ${issue.title} | ${getAssignee(s.participants, issue.assigneeId)} | ${dueDate} | ${esc} |`)
     })
     lines.push('')
   }
 
-  if (inProgressIssues.length > 0) {
+  if (s.inProgressIssues.length > 0) {
     lines.push('### 处理中问题')
     lines.push('')
-    lines.push('| 严重程度 | 问题 | 责任人 | 截止日期 |')
-    lines.push('|----------|------|--------|----------|')
-    inProgressIssues.forEach((issue) => {
-      const assignee = scenario.participants.find((p) => p.id === issue.assigneeId)
-      const severity = severityColors[issue.severity]?.label || issue.severity
+    lines.push('| 严重程度 | 问题 | 责任人 | 截止日期 | 升级路径 |')
+    lines.push('|----------|------|--------|----------|----------|')
+    s.inProgressIssues.forEach(issue => {
+      const severity = severityConfig[issue.severity]?.label || issue.severity
       const dueDate = issue.dueDate ? formatDate(issue.dueDate) : '-'
-      lines.push(`| ${severity} | ${issue.title} | ${assignee?.name || '-'} | ${dueDate} |`)
+      const esc = getEscalationPath(issue.severity).map(s2 => severityConfig[s2]?.label).join(' → ')
+      lines.push(`| ${severity} | ${issue.title} | ${getAssignee(s.participants, issue.assigneeId)} | ${dueDate} | ${esc} |`)
     })
     lines.push('')
   }
 
-  if (resolvedIssues.length > 0) {
+  if (s.resolvedIssues.length > 0) {
     lines.push('### 已解决问题')
     lines.push('')
     lines.push('| 严重程度 | 问题 | 责任人 | 解决方案 |')
     lines.push('|----------|------|--------|----------|')
-    resolvedIssues.forEach((issue) => {
-      const assignee = scenario.participants.find((p) => p.id === issue.assigneeId)
-      const severity = severityColors[issue.severity]?.label || issue.severity
+    s.resolvedIssues.forEach(issue => {
+      const severity = severityConfig[issue.severity]?.label || issue.severity
       const resolution = issue.resolution || '-'
-      lines.push(`| ${severity} | ${issue.title} | ${assignee?.name || '-'} | ${resolution} |`)
+      lines.push(`| ${severity} | ${issue.title} | ${getAssignee(s.participants, issue.assigneeId)} | ${resolution} |`)
     })
     lines.push('')
   }
 
-  if (scenario.issues.some((i) => i.rootCause)) {
+  if (Object.keys(s.rootCauseCounts).length > 0) {
     lines.push('## 根因分析')
     lines.push('')
-    const rootCauseCounts = {}
-    scenario.issues.forEach((issue) => {
-      if (issue.rootCause) {
-        rootCauseCounts[issue.rootCause] = (rootCauseCounts[issue.rootCause] || 0) + 1
-      }
-    })
-    Object.entries(rootCauseCounts).forEach(([category, count]) => {
+    Object.entries(s.rootCauseCounts).forEach(([category, count]) => {
       const cat = getRootCauseCategory(category)
       lines.push(`- **${cat.label}**: ${count} 个问题`)
     })
     lines.push('')
   }
 
-  if (scenario.actionItems?.length > 0) {
+  if (s.actionItems.length > 0) {
     lines.push('## Action Items')
     lines.push('')
-    lines.push('| 状态 | 任务 | 责任人 | 截止日期 |')
-    lines.push('|------|------|--------|----------|')
-    scenario.actionItems.forEach((action) => {
-      const assignee = scenario.participants.find((p) => p.id === action.assigneeId)
+    lines.push('| 状态 | 任务 | 责任人 | 截止日期 | 重开次数 |')
+    lines.push('|------|------|--------|----------|----------|')
+    s.actionItems.forEach(action => {
       const status = actionItemStatusConfig[action.status]?.label || action.status
       const dueDate = action.dueDate ? formatDate(action.dueDate) : '-'
-      lines.push(`| ${status} | ${action.title} | ${assignee?.name || '-'} | ${dueDate} |`)
+      const rc = action.reopenCount || 0
+      lines.push(`| ${status} | ${action.title} | ${getAssignee(s.participants, action.assigneeId)} | ${dueDate} | ${rc} |`)
     })
     lines.push('')
-
-    const completedActions = scenario.actionItems.filter((a) => a.status === 'completed' || a.status === 'verified')
     lines.push(`### Action Item 完成率`)
-    lines.push(`${completedActions.length} / ${scenario.actionItems.length} (${
-      scenario.actionItems.length > 0
-        ? Math.round((completedActions.length / scenario.actionItems.length) * 100)
-        : 0
+    lines.push(`${s.completedActions.length} / ${s.actionItems.length} (${
+      s.actionItems.length > 0 ? Math.round((s.completedActions.length / s.actionItems.length) * 100) : 0
     }%)`)
     lines.push('')
   }
 
   lines.push('---')
   lines.push(`*报告生成时间: ${formatDateTime(new Date().toISOString())}*`)
+  return lines.join('\n')
+}
 
+const exportConfluenceReport = (scenario, s) => {
+  const lines = []
+  lines.push(`h1. 应急演练复盘报告: ${s.overview.title}`)
+  lines.push('')
+  lines.push(`*演练日期*: ${s.overview.date}`)
+  lines.push('')
+  lines.push(`{status:title=演练状态|color=green}`)
+  lines.push('')
+
+  if (s.overview.description) {
+    lines.push('h2. 演练概述')
+    lines.push(`{panel:title=概述|borderStyle=dashed|borderColor=#ccc}`)
+    lines.push(s.overview.description)
+    lines.push('{panel}')
+    lines.push('')
+  }
+
+  if (s.objectives.length > 0) {
+    lines.push('h2. 演练目标')
+    s.objectives.forEach((obj, i) => {
+      const icon = obj.achieved ? '(check)' : '(x)'
+      lines.push(`* ${i + 1}. ${obj.description} ${icon}`)
+      if (obj.target) lines.push(`** 目标值: ${obj.target}`)
+      if (obj.actual != null) lines.push(`** 实际值: ${obj.actual}`)
+    })
+    lines.push('')
+  }
+
+  lines.push('h2. 参演人员')
+  lines.push('')
+  lines.push('|| 姓名 || 角色 || 部门 || 值班安排 || 节假日优先级 ||')
+  s.participants.forEach(p => {
+    const shift = p.shiftSchedule || '-'
+    const hp = p.shiftRotation?.holidayPriority
+    const hpLabel = hp ? holidayPriorityLevels.find(h => h.level === hp)?.label || '常规' : '常规'
+    lines.push(`| ${p.name} | ${p.role || '-'} | ${p.department || '-'} | ${shift} | ${hpLabel} |`)
+  })
+  lines.push('')
+
+  lines.push('h2. 问题统计')
+  lines.push(`{chart:type=pie|title=问题分布|width=400|height=300}`)
+  lines.push(`待处理=${s.todoIssues.length}`)
+  lines.push(`处理中=${s.inProgressIssues.length}`)
+  lines.push(`已解决=${s.resolvedIssues.length}`)
+  lines.push('{chart}')
+  lines.push('')
+
+  if (s.actionItems.length > 0) {
+    lines.push('h2. Action Items 进度')
+    lines.push(`{progress:total=${s.actionItems.length}|color=green}`)
+    lines.push(`${s.completedActions.length}`)
+    lines.push('{progress}')
+    lines.push('')
+  }
+
+  lines.push('h2. 问题明细')
+  lines.push('')
+  lines.push('|| 严重程度 || 问题 || 责任人 || 状态 || 截止日期 ||')
+  s.issues.forEach(issue => {
+    const severity = severityConfig[issue.severity]?.label || issue.severity
+    const status = statusConfig[issue.status]?.label || issue.status
+    const dueDate = issue.dueDate ? formatDate(issue.dueDate) : '-'
+    lines.push(`| ${severity} | ${issue.title} | ${getAssignee(s.participants, issue.assigneeId)} | ${status} | ${dueDate} |`)
+  })
+  lines.push('')
+
+  lines.push('{toc}')
+  lines.push('')
+  lines.push(`{note}报告生成时间: ${formatDateTime(new Date().toISOString())}{note}`)
+  return lines.join('\n')
+}
+
+const exportNotionReport = (scenario, s) => {
+  const lines = []
+  lines.push(`# 📋 应急演练复盘: ${s.overview.title}`)
+  lines.push('')
+  lines.push('> [!info] 基本信息')
+  lines.push(`> - **演练日期**: ${s.overview.date}`)
+  if (s.overview.description) lines.push(`> - **描述**: ${s.overview.description}`)
+  lines.push('')
+
+  if (s.slo || s.rto) {
+    lines.push('## 🎯 SLO / RTO 指标')
+    lines.push('')
+    if (s.slo) lines.push(`- 📊 **SLO**: ${typeof s.slo === 'string' ? s.slo : formatSlo(s.slo)}`)
+    if (s.rto) {
+      const rtoStr = typeof s.rto === 'string' ? s.rto : formatRto(s.rto)
+      const met = isRtoMet(s.rto)
+      lines.push(`- ⏱️ **RTO**: ${rtoStr} ${met != null ? (met ? '✅' : '❌') : ''}`)
+    }
+    lines.push('')
+  }
+
+  if (s.objectives.length > 0) {
+    lines.push('## 🎯 演练目标')
+    lines.push('')
+    s.objectives.forEach((obj) => {
+      const status = obj.achieved ? '✅ Done' : '🔄 In Progress'
+      lines.push(`- [${obj.achieved ? 'x' : ' '}] **${obj.description}** — ${status}`)
+      if (obj.target) lines.push(`  - 目标: \`${obj.target}\``)
+      if (obj.actual != null) lines.push(`  - 实际: \`${obj.actual}\``)
+    })
+    lines.push('')
+  }
+
+  lines.push('## 👥 参演人员')
+  lines.push('')
+  lines.push('| 姓名 | 角色 | 部门 | 节假日等级 |')
+  lines.push('| :--- | :--- | :--- | :--- |')
+  s.participants.forEach(p => {
+    const hp = p.shiftRotation?.holidayPriority
+    const hpLabel = hp ? holidayPriorityLevels.find(h => h.level === hp)?.label || '常规' : '常规'
+    lines.push(`| ${p.name} | ${p.role || '-'} | ${p.department || '-'} | ${hpLabel} |`)
+  })
+  lines.push('')
+
+  lines.push('## 📈 问题汇总 (看板视图)')
+  lines.push('')
+  lines.push('### 📝 待处理')
+  s.todoIssues.forEach(i => lines.push(`- **${severityConfig[i.severity]?.label || ''}** \`${i.title}\` @${getAssignee(s.participants, i.assigneeId)}`))
+  lines.push('')
+  lines.push('### 🔄 处理中')
+  s.inProgressIssues.forEach(i => lines.push(`- **${severityConfig[i.severity]?.label || ''}** \`${i.title}\` @${getAssignee(s.participants, i.assigneeId)}`))
+  lines.push('')
+  lines.push('### ✅ 已解决')
+  s.resolvedIssues.forEach(i => lines.push(`- **${severityConfig[i.severity]?.label || ''}** \`${i.title}\` @${getAssignee(s.participants, i.assigneeId)}`))
+  lines.push('')
+
+  if (s.actionItems.length > 0) {
+    lines.push('## ✅ Action Items')
+    lines.push('')
+    const completionRate = s.actionItems.length > 0 ? Math.round((s.completedActions.length / s.actionItems.length) * 100) : 0
+    lines.push(`> 完成率: ${completionRate}% (${s.completedActions.length}/${s.actionItems.length})`)
+    lines.push('')
+    s.actionItems.forEach(a => {
+      const done = a.status === 'completed' || a.status === 'verified'
+      const statusIcon = { pending: '⏳', in_progress: '🔄', blocked: '🚫', completed: '✅', verified: '✓' }[a.status] || '•'
+      lines.push(`- [${done ? 'x' : ' '}] ${statusIcon} **${a.title}** — @${getAssignee(s.participants, a.assigneeId)}`)
+      if (a.reopenCount) lines.push(`  ⚠️ 已重开 ${a.reopenCount} 次`)
+    })
+    lines.push('')
+  }
+
+  lines.push('---')
+  lines.push(`*Created: ${formatDateTime(new Date().toISOString())} | Powered by Drill Board*`)
   return lines.join('\n')
 }
 
