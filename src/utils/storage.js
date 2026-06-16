@@ -5,11 +5,29 @@ const DEFAULT_QUOTA_BYTES = 5 * 1024 * 1024
 const WARNING_THRESHOLD = 0.85
 const LRU_MIN_KEEP = 1
 
-const IDB_NAME = 'DrillBoardDB'
+const IDB_NAME_PREFIX = 'DrillBoardDB'
 const IDB_VERSION = 1
 const IDB_STORE_MAIN = 'scenarios'
 const IDB_STORE_META = 'meta'
 const IDB_STORE_CONFIG = 'config'
+const IDB_ORIGIN_WHITELIST = null
+
+const getOriginSlug = () => {
+  if (typeof location === 'undefined') return 'default'
+  try {
+    return location.origin.replace(/[^a-zA-Z0-9]/g, '_')
+  } catch {
+    return 'unknown'
+  }
+}
+
+const IDB_NAME = `${IDB_NAME_PREFIX}_${getOriginSlug()}`
+
+const checkOriginAllowed = () => {
+  if (!IDB_ORIGIN_WHITELIST) return true
+  if (typeof location === 'undefined') return false
+  return IDB_ORIGIN_WHITELIST.includes(location.origin)
+}
 
 const textEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null
 const getStringBytes = (str) => {

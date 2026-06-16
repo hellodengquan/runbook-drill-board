@@ -2,8 +2,18 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { generateTimelineEvents, formatDateTime, severityConfig, actionItemStatusConfig } from '../utils/helpers'
 
 const LOW_END_THROTTLE_MS = 16
+const REDUCED_MOTION_THROTTLE_MS = 32
 const PASSIVE_OPT = { passive: true }
 const NON_PASSIVE_OPT = { passive: false }
+
+const checkReducedMotion = () => {
+  if (typeof window === 'undefined' || !window.matchMedia) return false
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  } catch {
+    return false
+  }
+}
 
 export default function Timeline({ scenario, runtimeConfig }) {
   const events = useMemo(() => generateTimelineEvents(scenario), [scenario])
@@ -14,6 +24,7 @@ export default function Timeline({ scenario, runtimeConfig }) {
   const [scrollLeft, setScrollLeft] = useState(0)
   const [zoom, setZoom] = useState(1)
   const [selectedEvent, setSelectedEvent] = useState(null)
+  const [reducedMotion, setReducedMotion] = useState(() => checkReducedMotion())
 
   const touchState = useRef({
     startX: 0, startY: 0, initialDist: 0, initialZoom: 1,
@@ -22,9 +33,27 @@ export default function Timeline({ scenario, runtimeConfig }) {
   })
   const rafRef = useRef(0)
 
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const handler = (e) => setReducedMotion(e.matches)
+    if (mql.addEventListener) {
+      mql.addEventListener('change', handler)
+      return () => mql.removeEventListener('change', handler)
+    } else if (mql.addListener) {
+      mql.addListener(handler)
+      return () => mql.removeListener(handler)
+    }
+  }, [])
+
   const enableTouchOpt = runtimeConfig?.timeline?.enableTouchOptimization !== false
-  const throttleMs = runtimeConfig?.timeline?.androidLowEndThrottleMs ?? LOW_END_THROTTLE_MS
+  const baseThrottle = runtimeConfig?.timeline?.androidLowEndThrottleMs ?? LOW_END_THROTTLE_MS
+  const respectReducedMotion = runtimeConfig?.timeline?.respectReducedMotion !== false
+  const throttleMs = respectReducedMotion && reducedMotion
+    ? Math.max(baseThrottle, REDUCED_MOTION_THROTTLE_MS)
+    : baseThrottle
   const usePassive = runtimeConfig?.timeline?.passiveEvents !== false
+  const smoothAnimations = !reducedMotion
 
   useEffect(() => {
     setViewport({ start: 0, end: Math.min(events.length, 50) })

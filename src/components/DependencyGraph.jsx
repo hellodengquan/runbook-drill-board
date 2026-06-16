@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { generateDependencyGraph, severityConfig, statusConfig, actionItemStatusConfig } from '../utils/helpers'
 
 const DEFAULT_COLUMN_GAP = 240
+const ROW_HEIGHT_ESTIMATE = 60
 
 export default function DependencyGraph({ scenario, runtimeConfig }) {
   const graphData = useMemo(() => generateDependencyGraph(scenario, { enableOptimization: true }), [scenario])
@@ -10,6 +11,9 @@ export default function DependencyGraph({ scenario, runtimeConfig }) {
   const [useClustered, setUseClustered] = useState(graphData.clustered)
   const [columnVirtEnabled, setColumnVirtEnabled] = useState(
     runtimeConfig?.depGraph?.columnVirtualization !== false
+  )
+  const [rowVirtEnabled, setRowVirtEnabled] = useState(
+    runtimeConfig?.depGraph?.rowVirtualization !== false
   )
   const svgRef = useRef(null)
   const panState = useRef({ startX: 0, startY: 0, viewBoxX: 0, viewBoxY: 0 })
@@ -50,21 +54,57 @@ export default function DependencyGraph({ scenario, runtimeConfig }) {
     }))
   }, [nodes])
 
+  const rowsInfo = useMemo(() => {
+    const byRow = {}
+    nodes.forEach(n => {
+      const row = n.row ?? Math.floor(n.y / ROW_HEIGHT_ESTIMATE)
+      if (!byRow[row]) byRow[row] = { nodes: [], minY: Infinity, maxY: -Infinity }
+      byRow[row].nodes.push(n)
+      byRow[row].minY = Math.min(byRow[row].minY, n.y - 40)
+      byRow[row].maxY = Math.max(byRow[row].maxY, n.y + 40)
+    })
+    return Object.values(byRow).sort((a, b) => a.minY - b.minY).map(row => ({
+      ...row,
+      rowId: row.nodes[0]?.row ?? row.minY
+    }))
+  }, [nodes])
+
   const visibleNodeIds = useMemo(() => {
-    if (!columnVirtEnabled || columnsInfo.length <= 4 || nodes.length <= maxNodesFullView) {
+    const colEnabled = columnVirtEnabled && columnsInfo.length > 4
+    const rowEnabled = rowVirtEnabled && rowsInfo.length > 6
+    if ((!colEnabled && !rowEnabled) || nodes.length <= maxNodesFullView) {
       return null
     }
+
     const padX = viewBox.w * 0.4
+    const padY = viewBox.h * 0.3
     const vxMin = viewBox.x - padX
     const vxMax = viewBox.x + viewBox.w + padX
-    const ids = new Set()
-    columnsInfo.forEach(col => {
-      if (col.maxX >= vxMin && col.minX <= vxMax) {
-        col.nodes.forEach(n => ids.add(n.id))
-      }
-    })
-    return ids
-  }, [columnsInfo, viewBox, columnVirtEnabled, nodes.length, maxNodesFullView])
+    const vyMin = viewBox.y - padY
+    const vyMax = viewBox.y + viewBox.h + padY
+
+    let candidates = nodes
+    if (colEnabled) {
+      const colIds = new Set()
+      columnsInfo.forEach(col => {
+        if (col.maxX >= vxMin && col.minX <= vxMax) {
+          col.nodes.forEach(n => colIds.add(n.id))
+        }
+      })
+      candidates = candidates.filter(n => colIds.has(n.id))
+    }
+    if (rowEnabled) {
+      const rowIds = new Set()
+      rowsInfo.forEach(row => {
+        if (row.maxY >= vyMin && row.minY <= vyMax) {
+          row.nodes.forEach(n => rowIds.add(n.id))
+        }
+      })
+      candidates = candidates.filter(n => rowIds.has(n.id))
+    }
+
+    return new Set(candidates.map(n => n.id))
+  }, [columnsInfo, rowsInfo, viewBox, columnVirtEnabled, rowVirtEnabled, nodes.length, maxNodesFullView])
 
   const displayedNodes = visibleNodeIds
     ? nodes.filter(n => visibleNodeIds.has(n.id))

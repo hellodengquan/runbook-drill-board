@@ -108,6 +108,13 @@ export const throughputUnits = [
   { id: 'tps', label: 'TPS', multiplier: 1 }
 ]
 
+export const sliWindowUnits = [
+  { id: 'minute', label: '分钟', multiplier: 1 },
+  { id: 'hour', label: '小时', multiplier: 60 },
+  { id: 'day', label: '天', multiplier: 1440 },
+  { id: 'week', label: '周', multiplier: 10080 }
+]
+
 export const createSli = (type = sliTypes.AVAILABILITY, config = {}) => {
   const base = {
     id: `sli-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
@@ -118,43 +125,63 @@ export const createSli = (type = sliTypes.AVAILABILITY, config = {}) => {
   switch (type) {
     case sliTypes.ERROR_RATE: {
       const threshold = config.threshold ?? 0.1
+      const windowSize = config.windowSize ?? 5
+      const windowUnit = config.windowUnit ?? 'minute'
+      const unitLabel = sliWindowUnits.find(u => u.id === windowUnit)?.label || '分钟'
       return {
         ...base,
         threshold: Number(threshold.toFixed(6)),
         thresholdType: 'percent',
         actualValue: config.actualValue ?? null,
-        raw: `错误率 ≤ ${Number(threshold.toFixed(2))}%`
+        windowSize,
+        windowUnit,
+        raw: `错误率 ≤ ${Number(threshold.toFixed(2))}% (${windowSize} ${unitLabel}窗口)`
       }
     }
     case sliTypes.THROUGHPUT: {
       const minVal = config.minValue ?? 1000
       const unit = config.unit ?? 'rps'
+      const windowSize = config.windowSize ?? 1
+      const windowUnit = config.windowUnit ?? 'minute'
+      const unitLabel = sliWindowUnits.find(u => u.id === windowUnit)?.label || '分钟'
       return {
         ...base,
         minValue: minVal,
         unit,
         actualValue: config.actualValue ?? null,
-        raw: `吞吐量 ≥ ${minVal} ${throughputUnits.find(u => u.id === unit)?.label || 'RPS'}`
+        windowSize,
+        windowUnit,
+        raw: `吞吐量 ≥ ${minVal} ${throughputUnits.find(u => u.id === unit)?.label || 'RPS'} (${windowSize} ${unitLabel}窗口)`
       }
     }
     case sliTypes.LATENCY_P99: {
       const thresholdMs = config.thresholdMs ?? 500
+      const windowSize = config.windowSize ?? 5
+      const windowUnit = config.windowUnit ?? 'minute'
+      const unitLabel = sliWindowUnits.find(u => u.id === windowUnit)?.label || '分钟'
       return {
         ...base,
         thresholdMs,
         actualValueMs: config.actualValueMs ?? null,
-        raw: `P99 延迟 ≤ ${thresholdMs}ms`
+        windowSize,
+        windowUnit,
+        raw: `P99 延迟 ≤ ${thresholdMs}ms (${windowSize} ${unitLabel}窗口)`
       }
     }
     case sliTypes.AVAILABILITY:
     default: {
       const threshold = config.threshold ?? 99.9
+      const windowSize = config.windowSize ?? 30
+      const windowUnit = config.windowUnit ?? 'day'
+      const unitLabel = sliWindowUnits.find(u => u.id === windowUnit)?.label || '天'
       return {
         ...base,
         threshold: Number(threshold.toFixed(6)),
         thresholdType: 'percent',
         actualValue: config.actualValue ?? null,
-        raw: `可用性 ≥ ${Number(threshold.toFixed(2))}%`
+        windowSize,
+        windowUnit,
+        raw: `可用性 ≥ ${Number(threshold.toFixed(2))}% (${windowSize} ${unitLabel}窗口)`
       }
     }
   }
@@ -180,19 +207,6 @@ export const createSloWithSlis = ({
   }
 }
 
-export const validateSli = (sli) => {
-  if (!sli || !sli.type) return { valid: false, reason: 'SLI 类型缺失' }
-  switch (sli.type) {
-    case sliTypes.ERROR_RATE:
-      if (sli.threshold < 0 || sli.threshold > 100) return { valid: false, reason: '错误率阈值需 0~100%' }
-      break
-    case sliTypes.THROUGHPUT:
-      if (sli.minValue < 0) return { valid: false, reason: '吞吐量不能为负' }
-      break
-  }
-  return { valid: true }
-}
-
 export const isSliMet = (sli) => {
   if (!sli || sli.actualValue == null && sli.actualValueMs == null) return null
   switch (sli.type) {
@@ -209,21 +223,38 @@ export const isSliMet = (sli) => {
   }
 }
 
-export const formatSli = (sli) => {
+export const formatSli = (sli, includeWindow = true) => {
   if (!sli) return ''
+  const windowLabel = includeWindow && sli.windowSize
+    ? ` [${sli.windowSize}${sliWindowUnits.find(u => u.id === sli.windowUnit)?.label || ''}]`
+    : ''
   switch (sli.type) {
     case sliTypes.ERROR_RATE:
-      return `错误率 ${sli.actualValue != null ? `${Number(sli.actualValue.toFixed(2))}% / ` : ''}≤ ${Number(sli.threshold.toFixed(2))}%`
+      return `错误率 ${sli.actualValue != null ? `${Number(sli.actualValue.toFixed(2))}% / ` : ''}≤ ${Number(sli.threshold.toFixed(2))}%${windowLabel}`
     case sliTypes.THROUGHPUT: {
       const unit = throughputUnits.find(u => u.id === sli.unit)?.label || 'RPS'
-      return `吞吐量 ${sli.actualValue != null ? `${sli.actualValue}${unit} / ` : ''}≥ ${sli.minValue}${unit}`
+      return `吞吐量 ${sli.actualValue != null ? `${sli.actualValue}${unit} / ` : ''}≥ ${sli.minValue}${unit}${windowLabel}`
     }
     case sliTypes.LATENCY_P99:
-      return `P99 ${sli.actualValueMs != null ? `${sli.actualValueMs}ms / ` : ''}≤ ${sli.thresholdMs}ms`
+      return `P99 ${sli.actualValueMs != null ? `${sli.actualValueMs}ms / ` : ''}≤ ${sli.thresholdMs}ms${windowLabel}`
     case sliTypes.AVAILABILITY:
     default:
-      return `可用性 ${sli.actualValue != null ? `${Number(sli.actualValue.toFixed(2))}% / ` : ''}≥ ${Number(sli.threshold.toFixed(2))}%`
+      return `可用性 ${sli.actualValue != null ? `${Number(sli.actualValue.toFixed(2))}% / ` : ''}≥ ${Number(sli.threshold.toFixed(2))}%${windowLabel}`
   }
+}
+
+export const validateSli = (sli) => {
+  if (!sli || !sli.type) return { valid: false, reason: 'SLI 类型缺失' }
+  if (sli.windowSize && sli.windowSize <= 0) return { valid: false, reason: '窗口大小必须大于0' }
+  switch (sli.type) {
+    case sliTypes.ERROR_RATE:
+      if (sli.threshold < 0 || sli.threshold > 100) return { valid: false, reason: '错误率阈值需 0~100%' }
+      break
+    case sliTypes.THROUGHPUT:
+      if (sli.minValue < 0) return { valid: false, reason: '吞吐量不能为负' }
+      break
+  }
+  return { valid: true }
 }
 
 /* ============================================
@@ -1173,6 +1204,73 @@ export const MlSeverityLearner = {
   samples: [],
   MAX_SAMPLES: 5000,
   LEARNING_INTERVAL: 100,
+  MIN_SAMPLES_FOR_NORMAL: 30,
+  FALLBACK_CONFIDENCE_LEVEL: 0.8,
+  FALLBACK_SAFETY_MARGIN: 1.5,
+
+  _tDistributionCriticalValue(df, confidence = 0.95) {
+    const approx = {
+      1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+      6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+      15: 2.131, 20: 2.086, 25: 2.060, 30: 2.042, 100: 1.984
+    }
+    if (df <= 0) return 10
+    if (df >= 100) return 1.96
+    const keys = Object.keys(approx).map(Number).sort((a, b) => a - b)
+    let lower = keys[0], upper = keys[keys.length - 1]
+    for (const k of keys) {
+      if (k <= df) lower = k
+      if (k >= df) { upper = k; break }
+    }
+    if (lower === upper) return approx[lower]
+    const ratio = (df - lower) / (upper - lower)
+    return approx[lower] + ratio * (approx[upper] - approx[lower])
+  },
+
+  _mean(arr) {
+    if (!arr.length) return 0
+    return arr.reduce((s, v) => s + v, 0) / arr.length
+  },
+
+  _stdDev(arr, mean) {
+    if (arr.length < 2) return 0
+    const m = mean != null ? mean : this._mean(arr)
+    const sqSum = arr.reduce((s, v) => s + (v - m) * (v - m), 0)
+    return Math.sqrt(sqSum / (arr.length - 1))
+  },
+
+  _bayesianEstimate(samples, priorMean, priorStrength = 3) {
+    if (!samples.length) return { mean: priorMean, std: priorMean * 0.5, method: 'prior' }
+    const n = samples.length
+    const sampleMean = this._mean(samples)
+    const sampleStd = this._stdDev(samples, sampleMean)
+    const posteriorMean = (priorStrength * priorMean + n * sampleMean) / (priorStrength + n)
+    const posteriorStd = n > 1
+      ? Math.sqrt(
+          ((n - 1) * sampleStd * sampleStd + priorStrength * priorMean * priorMean * 0.5) /
+          (n + priorStrength - 1)
+        )
+      : priorMean * 0.5
+    return { mean: posteriorMean, std: posteriorStd, method: 'bayesian' }
+  },
+
+  _confidenceInterval(samples, confidence = 0.95) {
+    if (!samples.length) return { lower: 0, upper: 0, method: 'no-data' }
+    const n = samples.length
+    const mean = this._mean(samples)
+    const std = this._stdDev(samples, mean)
+
+    if (n >= this.MIN_SAMPLES_FOR_NORMAL) {
+      const z = confidence === 0.95 ? 1.96 : confidence === 0.9 ? 1.645 : 2.576
+      const margin = z * std / Math.sqrt(n)
+      return { lower: mean - margin, upper: mean + margin, mean, std, method: 'normal' }
+    }
+
+    const df = n - 1
+    const t = this._tDistributionCriticalValue(df, confidence)
+    const margin = t * std / Math.sqrt(n)
+    return { lower: mean - margin, upper: mean + margin, mean, std, method: 't-distribution' }
+  },
 
   addSample(issue, actualDurationMin, finalResolution) {
     if (this.samples.length >= this.MAX_SAMPLES) {
@@ -1212,20 +1310,75 @@ export const MlSeverityLearner = {
 
   calculateSuggestedThresholds() {
     const groups = this._groupBySeverity()
-    const suggestion = { generatedAt: Date.now(), sampleCount: this.samples.length, thresholds: {} }
+    const suggestion = {
+      generatedAt: Date.now(),
+      sampleCount: this.samples.length,
+      thresholds: {},
+      methodPerSeverity: {},
+      hasEnoughSamples: this.samples.length >= this.MIN_SAMPLES_FOR_NORMAL * 4
+    }
+    const defaultPriors = {
+      critical: { duration: 120, impact: 1000 },
+      high: { duration: 60, impact: 500 },
+      medium: { duration: 30, impact: 100 },
+      low: { duration: 15, impact: 10 }
+    }
+
     Object.keys(groups).forEach(sev => {
       const list = groups[sev]
       const durations = list.map(s => s.durationMin)
       const impacts = list.map(s => s.impactUsers)
+      const prior = defaultPriors[sev] || { duration: 30, impact: 100 }
+
+      let durationEstimate, impactEstimate, method
+
+      if (list.length >= this.MIN_SAMPLES_FOR_NORMAL) {
+        const ciDuration = this._confidenceInterval(durations, this.FALLBACK_CONFIDENCE_LEVEL)
+        const ciImpact = this._confidenceInterval(impacts, this.FALLBACK_CONFIDENCE_LEVEL)
+        durationEstimate = ciDuration.upper
+        impactEstimate = ciImpact.upper
+        method = ciDuration.method
+      } else if (list.length >= 3) {
+        const bayesDuration = this._bayesianEstimate(durations, prior.duration)
+        const bayesImpact = this._bayesianEstimate(impacts, prior.impact)
+        durationEstimate = bayesDuration.mean + bayesDuration.std * this.FALLBACK_SAFETY_MARGIN
+        impactEstimate = bayesImpact.mean + bayesImpact.std * this.FALLBACK_SAFETY_MARGIN
+        method = bayesDuration.method
+      } else {
+        durationEstimate = prior.duration * this.FALLBACK_SAFETY_MARGIN
+        impactEstimate = prior.impact * this.FALLBACK_SAFETY_MARGIN
+        method = 'prior-only'
+      }
+
+      const durP95 = list.length >= 5 ? this._percentile(durations, 95) : durationEstimate
+      const durP99 = list.length >= 10 ? this._percentile(durations, 99) : durationEstimate * 1.5
+
       suggestion.thresholds[sev] = {
-        durationP50: this._percentile(durations, 50),
-        durationP95: this._percentile(durations, 95),
-        durationP99: this._percentile(durations, 99),
-        impactP95: this._percentile(impacts, 95),
-        autoEscalationMinutes: Math.max(5, Math.round(this._percentile(durations, 60))),
-        impactThreshold: Math.max(10, Math.round(this._percentile(impacts, 80)))
+        durationP50: list.length >= 5 ? this._percentile(durations, 50) : durationEstimate * 0.6,
+        durationP95: durP95,
+        durationP99: durP99,
+        impactP95: list.length >= 5 ? this._percentile(impacts, 95) : impactEstimate,
+        autoEscalationMinutes: Math.max(5, Math.round(durationEstimate * 0.8)),
+        impactThreshold: Math.max(10, Math.round(impactEstimate * 0.7))
+      }
+      suggestion.methodPerSeverity[sev] = method
+    })
+
+    Object.keys(defaultPriors).forEach(sev => {
+      if (!suggestion.thresholds[sev]) {
+        const prior = defaultPriors[sev]
+        suggestion.thresholds[sev] = {
+          durationP50: prior.duration * 0.6,
+          durationP95: prior.duration * this.FALLBACK_SAFETY_MARGIN,
+          durationP99: prior.duration * this.FALLBACK_SAFETY_MARGIN * 1.5,
+          impactP95: prior.impact * this.FALLBACK_SAFETY_MARGIN,
+          autoEscalationMinutes: Math.max(5, Math.round(prior.duration * 0.8)),
+          impactThreshold: Math.max(10, Math.round(prior.impact * 0.7))
+        }
+        suggestion.methodPerSeverity[sev] = 'prior-only'
       }
     })
+
     return suggestion
   },
 
@@ -1243,7 +1396,11 @@ export const MlSeverityLearner = {
         })
       }
     })
-    merged._learned = { at: suggestion.generatedAt, samples: suggestion.sampleCount }
+    merged._learned = {
+      at: suggestion.generatedAt,
+      samples: suggestion.sampleCount,
+      method: suggestion.hasEnoughSamples ? 'empirical' : 'statistical-fallback'
+    }
     return merged
   }
 }
@@ -1391,26 +1548,31 @@ export const defaultRuntimeConfig = {
     useIndexedDBFallback: true,
     evictOnStartup: false
   },
-  sync: {
-    maxRetries: 5,
-    clockDriftToleranceMs: 5000,
-    offlineTimeoutMs: 10000,
-    snapshotMergeEnabled: true
-  },
   timeline: {
     enableTouchOptimization: true,
     androidLowEndThrottleMs: 16,
-    passiveEvents: true
+    passiveEvents: true,
+    respectReducedMotion: true
   },
   depGraph: {
     columnVirtualization: true,
+    rowVirtualization: true,
     clusterThreshold: 8,
     maxNodesFullView: 300
   },
   export: {
     confluenceSpaceKey: 'DRILL',
     notionParentPageId: '',
-    defaultFormat: 'standard'
+    defaultFormat: 'standard',
+    oauthForcePkce: true,
+    oauthPkceMethod: 'S256'
+  },
+  sync: {
+    maxRetries: 5,
+    clockDriftToleranceMs: 5000,
+    offlineTimeoutMs: 10000,
+    snapshotMergeEnabled: true,
+    deletionConflictStrategy: 'user_decides'
   },
   _meta: {
     updatedAt: Date.now(),
@@ -1433,7 +1595,9 @@ export class RuntimeConfigService {
     this.storage = storage
     this.config = JSON.parse(JSON.stringify(initial))
     this.listeners = new Set()
+    this.auditLog = []
     this.currentUser = { id: 'u-default', name: '当前用户', role: Role.MEMBER }
+    this.MAX_AUDIT_LOG = 100
   }
 
   async load() {
@@ -1443,21 +1607,67 @@ export class RuntimeConfigService {
         this.config = { ...this.config, ...saved }
         return { ok: true, fromStorage: true }
       }
+      const auditSaved = await this.storage?.getAuditLog?.()
+      if (Array.isArray(auditSaved)) {
+        this.auditLog = auditSaved.slice(-this.MAX_AUDIT_LOG)
+      }
     } catch (_) { /* ignore */ }
     return { ok: true, fromStorage: false, usedDefaults: true }
+  }
+
+  _addAuditLog(action, changes, actor) {
+    const entry = {
+      id: `audit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      action,
+      changes,
+      actor: { id: actor.id, name: actor.name, role: actor.role },
+      timestamp: Date.now()
+    }
+    this.auditLog.push(entry)
+    if (this.auditLog.length > this.MAX_AUDIT_LOG) {
+      this.auditLog = this.auditLog.slice(-this.MAX_AUDIT_LOG)
+    }
+    try { this.storage?.setAuditLog?.(this.auditLog) } catch (_) { /* ignore */ }
+  }
+
+  _extractChanges(oldConfig, newConfig, prefix = '') {
+    const changes = []
+    const allKeys = new Set([...Object.keys(oldConfig || {}), ...Object.keys(newConfig || {})])
+    allKeys.forEach(k => {
+      const path = prefix ? `${prefix}.${k}` : k
+      const oldVal = oldConfig?.[k]
+      const newVal = newConfig?.[k]
+      if (oldVal === newVal) return
+      if (oldVal && typeof oldVal === 'object' && !Array.isArray(oldVal) &&
+          newVal && typeof newVal === 'object' && !Array.isArray(newVal)) {
+        changes.push(...this._extractChanges(oldVal, newVal, path))
+      } else {
+        changes.push({ path, oldValue: oldVal, newValue: newVal })
+      }
+    })
+    return changes
   }
 
   async save(partialUpdate, actor = this.currentUser) {
     const permOk = this.can(actor.role, 'CONFIG_EDIT')
     if (!permOk) return { ok: false, error: `权限不足，需要: ${permissions.CONFIG_EDIT.join('/')}` }
+    const oldConfig = JSON.parse(JSON.stringify(this.config))
     const merged = this._deepMerge(this.config, partialUpdate)
     merged._meta = { ...this.config._meta, updatedAt: Date.now(), updatedBy: actor.id, version: (this.config._meta?.version || 0) + 1 }
     const errors = this._validate(merged)
     if (errors.length) return { ok: false, errors }
+    const changes = this._extractChanges(oldConfig, merged)
     this.config = merged
+    if (changes.length > 0) {
+      this._addAuditLog('config.update', changes, actor)
+    }
     this._notify()
     try { await this.storage?.setConfig?.(this.config) } catch (_) { /* ignore */ }
-    return { ok: true, version: this.config._meta.version }
+    return { ok: true, version: this.config._meta.version, changes }
+  }
+
+  getAuditLog(limit = 20) {
+    return this.auditLog.slice(-limit).reverse()
   }
 
   get(path, defaultValue = undefined) {

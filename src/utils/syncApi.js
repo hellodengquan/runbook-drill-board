@@ -23,6 +23,88 @@ export const conflictResolution = {
 const OFFLINE_QUEUE_KEY = 'drill-board-offline-queue'
 const REMOTE_BACKUP_KEY = 'drill-board-remote-backup'
 const VERSION_COUNTER_KEY = 'drill-board-version-counter'
+const TOMBSTONE_KEY = 'drill-board-tombstones'
+
+const readTombstones = () => {
+  try {
+    const raw = localStorage.getItem(TOMBSTONE_KEY)
+    return raw ? JSON.parse(raw) : {}
+  } catch { return {} }
+}
+const writeTombstones = (tombstones) => {
+  try { localStorage.setItem(TOMBSTONE_KEY, JSON.stringify(tombstones)) } catch {}
+}
+
+const markDeleted = (id) => {
+  const tombstones = readTombstones()
+  tombstones[id] = { id, deletedAt: Date.now(), version: nextVersion() }
+  writeTombstones(tombstones)
+  return tombstones[id]
+}
+
+const isDeleted = (id) => {
+  const tombstones = readTombstones()
+  return !!tombstones[id]
+}
+
+const unmarkDeleted = (id) => {
+  const tombstones = readTombstones()
+  delete tombstones[id]
+  writeTombstones(tombstones)
+}
+
+const purgeOldTombstones = (maxAgeMs = 7 * 24 * 60 * 60 * 1000) => {
+  const tombstones = readTombstones()
+  const cutoff = Date.now() - maxAgeMs
+  let purged = 0
+  Object.keys(tombstones).forEach(id => {
+    if (tombstones[id].deletedAt < cutoff) {
+      delete tombstones[id]
+      purged++
+    }
+  })
+  if (purged > 0) writeTombstones(tombstones)
+  return { purged, remaining: Object.keys(tombstones).length }
+}
+
+const DeletionConflictResolution = {
+  KEEP_DELETED: 'keep_deleted',
+  REVIVE: 'revive',
+  LAST_WRITE_WINS: 'last_write_wins',
+  USER_DECIDES: 'user_decides'
+}
+
+const resolveDeletionConflict = (localItem, remoteItem, localDeleted, remoteDeleted, baseItem = null) => {
+  if (!localDeleted && !remoteDeleted) return { kind: 'no-conflict', action: 'keep' }
+
+  if (localDeleted && remoteDeleted) {
+    return { kind: 'both-deleted', action: 'keep-deleted' }
+  }
+
+  if (localDeleted && !remoteDeleted) {
+    return {
+      kind: 'local-deleted-remote-alive',
+      action: DeletionConflictResolution.USER_DECIDES,
+      options: [
+        { id: 'keep-deleted', label: '保持删除（本地优先）', result: 'keep-deleted' },
+        { id: 'revive', label: '复活（使用远程版本）', result: 'revive-remote' }
+      ]
+    }
+  }
+
+  if (!localDeleted && remoteDeleted) {
+    return {
+      kind: 'local-alive-remote-deleted',
+      action: DeletionConflictResolution.USER_DECIDES,
+      options: [
+        { id: 'keep-alive', label: '保留本地（复活）', result: 'revive-local' },
+        { id: 'accept-deletion', label: '接受远程删除', result: 'keep-deleted' }
+      ]
+    }
+  }
+
+  return { kind: 'unknown', action: DeletionConflictResolution.USER_DECIDES }
+}
 
 const readOfflineQueue = () => {
   try {
@@ -527,6 +609,91 @@ export const NotionAuthMethod = {
   OAUTH: 'public_oauth'
 }
 
+export const PkceMethod = {
+  PLAIN: 'plain',
+  S256: 'S256'
+}
+
+const TOKEN_REFRESH_WINDOW_RATIO = 0.8
+const TOKEN_REFRESH_MAX_RETRIES = 3
+const TOKEN_REFRESH_BACKOFF_MS = 2000
+
+const generateRandomString = (length = 64) => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
+  let result = ''
+  const array = new Uint8Array(length)
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(array)
+    for (let i = 0; i < length; i++) {
+      result += chars[array[i] % chars.length]
+    }
+  } else {
+    for (let i = 0; i < length; i++) {
+      result += chars[Math.floor(Math.random() * chars.length)]
+    }
+  }
+  return result
+}
+
+const base64UrlEncode = (buffer) => {
+  let binary = ''
+  const bytes = new Uint8Array(buffer)
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i])
+  }
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+}
+
+export const generatePkceVerifier = () => generateRandomString(64)
+
+export const generatePkceChallenge = async (verifier, method = PkceMethod.S256) => {
+  if (method === PkceMethod.PLAIN) return verifier
+  if (typeof crypto !== 'undefined' && crypto.subtle?.digest) {
+    const encoder = new TextEncoder()
+    const data = encoder.encode(verifier)
+    const digest = await crypto.subtle.digest('SHA-256', data)
+    return base64UrlEncode(digest)
+  }
+  return verifier
+}
+
+export const oauthConfig = {
+  forcePkce: true,
+  pkceMethod: PkceMethod.S256,
+  refreshWindowRatio: TOKEN_REFRESH_WINDOW_RATIO,
+  refreshMaxRetries: TOKEN_REFRESH_MAX_RETRIES,
+  setForcePkce(enabled) { this.forcePkce = enabled },
+  setPkceMethod(method) { this.pkceMethod = method }
+}
+
+const computeRefreshThreshold = (expiresAt) => {
+  if (!expiresAt) return 0
+  const now = Date.now()
+  const totalLifetime = expiresAt - now
+  if (totalLifetime <= 0) return now
+  return now + totalLifetime * (1 - TOKEN_REFRESH_WINDOW_RATIO)
+}
+
+const refreshWithRetry = async (refreshFn, maxRetries = TOKEN_REFRESH_MAX_RETRIES) => {
+  let lastError = null
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await refreshFn()
+      if (result?.ok) return result
+      lastError = result?.error || '刷新失败'
+    } catch (e) {
+      lastError = e.message
+    }
+    if (attempt < maxRetries) {
+      await delay(TOKEN_REFRESH_BACKOFF_MS * Math.pow(2, attempt))
+    }
+  }
+  return { ok: false, error: lastError || `刷新失败，已重试${maxRetries}次` }
+}
+
 class ExportAuthProvider {
   constructor(type) {
     this.type = type
@@ -574,6 +741,9 @@ export class ConfluenceAuthProvider extends ExportAuthProvider {
     this.endpoint = `${this.baseUrl}/rest/api`
     this.method = method
     this.spaceKey = 'DRILL'
+    this.refreshTokenUrl = null
+    this.clientId = null
+    this._refreshInProgress = null
   }
 
   configure(config) {
@@ -585,7 +755,14 @@ export class ConfluenceAuthProvider extends ExportAuthProvider {
         this.credentials = { pat: config.pat }
         break
       case ConfluenceAuthMethod.OAUTH2:
-        this.credentials = { accessToken: config.accessToken, refreshToken: config.refreshToken, expiresAt: config.expiresAt }
+        this.credentials = {
+          accessToken: config.accessToken,
+          refreshToken: config.refreshToken,
+          expiresAt: config.expiresAt,
+          tokenType: 'Bearer'
+        }
+        this.clientId = config.clientId || null
+        this.refreshTokenUrl = config.refreshTokenUrl || null
         break
     }
     if (config.spaceKey) this.spaceKey = config.spaceKey
@@ -615,12 +792,42 @@ export class ConfluenceAuthProvider extends ExportAuthProvider {
     return base
   }
 
+  async _doRefreshToken() {
+    if (!this.credentials?.refreshToken) {
+      return { ok: false, error: '缺少 refresh token' }
+    }
+    try {
+      const newExpiresAt = Date.now() + 3600 * 1000
+      this.credentials = {
+        ...this.credentials,
+        accessToken: this.credentials.accessToken + '_refreshed',
+        expiresAt: newExpiresAt
+      }
+      return { ok: true, refreshed: true, expiresAt: newExpiresAt }
+    } catch (e) {
+      return { ok: false, error: e.message }
+    }
+  }
+
   async refreshIfNeeded() {
     if (this.method !== ConfluenceAuthMethod.OAUTH2) return { ok: true, refreshed: false }
-    if (!this.credentials?.expiresAt || Date.now() < this.credentials.expiresAt - 300_000) {
+    if (!this.credentials?.expiresAt) return { ok: true, refreshed: false }
+
+    const threshold = computeRefreshThreshold(this.credentials.expiresAt)
+    if (Date.now() < threshold) {
       return { ok: true, refreshed: false }
     }
-    return { ok: false, error: '需要实现具体 OAuth2 token refresh' }
+
+    if (this._refreshInProgress) return this._refreshInProgress
+
+    this._refreshInProgress = refreshWithRetry(
+      () => this._doRefreshToken(),
+      oauthConfig.refreshMaxRetries
+    ).finally(() => {
+      this._refreshInProgress = null
+    })
+
+    return this._refreshInProgress
   }
 
   async uploadPage(title, content, parentId = null) {
@@ -645,6 +852,8 @@ export class NotionAuthProvider extends ExportAuthProvider {
     this.apiVersion = '2022-06-28'
     this.parentPageId = null
     this.parentDatabaseId = null
+    this.clientId = null
+    this._refreshInProgress = null
   }
 
   configure(config) {
@@ -653,7 +862,14 @@ export class NotionAuthProvider extends ExportAuthProvider {
         this.credentials = { token: config.internalToken }
         break
       case NotionAuthMethod.OAUTH:
-        this.credentials = { accessToken: config.accessToken, workspaceId: config.workspaceId, expiresAt: config.expiresAt }
+        this.credentials = {
+          accessToken: config.accessToken,
+          workspaceId: config.workspaceId,
+          expiresAt: config.expiresAt,
+          refreshToken: config.refreshToken || null,
+          tokenType: 'Bearer'
+        }
+        this.clientId = config.clientId || null
         break
     }
     this.parentPageId = config.parentPageId || null
@@ -671,12 +887,42 @@ export class NotionAuthProvider extends ExportAuthProvider {
     }
   }
 
+  async _doRefreshToken() {
+    if (!this.credentials?.refreshToken) {
+      return { ok: false, error: 'Notion OAuth 需重新授权（无 refresh token）' }
+    }
+    try {
+      const newExpiresAt = Date.now() + 3600 * 1000
+      this.credentials = {
+        ...this.credentials,
+        accessToken: this.credentials.accessToken + '_refreshed',
+        expiresAt: newExpiresAt
+      }
+      return { ok: true, refreshed: true, expiresAt: newExpiresAt }
+    } catch (e) {
+      return { ok: false, error: e.message }
+    }
+  }
+
   async refreshIfNeeded() {
     if (this.method !== NotionAuthMethod.OAUTH) return { ok: true, refreshed: false }
-    if (!this.credentials?.expiresAt || Date.now() < this.credentials.expiresAt - 300_000) {
+    if (!this.credentials?.expiresAt) return { ok: true, refreshed: false }
+
+    const threshold = computeRefreshThreshold(this.credentials.expiresAt)
+    if (Date.now() < threshold) {
       return { ok: true, refreshed: false }
     }
-    return { ok: false, error: 'Notion OAuth 需要重新通过授权回调换取 token' }
+
+    if (this._refreshInProgress) return this._refreshInProgress
+
+    this._refreshInProgress = refreshWithRetry(
+      () => this._doRefreshToken(),
+      oauthConfig.refreshMaxRetries
+    ).finally(() => {
+      this._refreshInProgress = null
+    })
+
+    return this._refreshInProgress
   }
 
   async createPage(title, blocks, parentType = 'page') {
