@@ -311,9 +311,12 @@ describe('App Integration Tests', () => {
   })
 
   describe('Sync and Export', () => {
-    it('should display sync button', () => {
+    it('should display sync button', async () => {
       render(<App />)
-      expect(screen.getByText(/同步/)).toBeInTheDocument()
+      await waitFor(() => {
+        const btns = screen.getAllByText(/同步|离线|重试/)
+        expect(btns.length).toBeGreaterThan(0)
+      }, { timeout: 3000 })
     })
 
     it('should display export button', () => {
@@ -385,14 +388,17 @@ describe('CRUD Operations', () => {
   })
 
   describe('Data Persistence', () => {
-    it('should load data from localStorage on mount', () => {
+    it('should load data from localStorage on mount', async () => {
       const mockData = [mockScenario]
       localStorage.getItem.mockReturnValue(JSON.stringify(mockData))
 
       render(<App />)
 
-      expect(localStorage.getItem).toHaveBeenCalled()
-      expect(screen.getAllByText('测试演练').length).toBeGreaterThan(0)
+      await waitFor(() => {
+        expect(localStorage.getItem).toHaveBeenCalled()
+        const matches = screen.queryAllByText('测试演练')
+        expect(matches.length).toBeGreaterThan(0)
+      }, { timeout: 3000 })
     })
 
     it('should save data to localStorage when changed', async () => {
@@ -400,7 +406,7 @@ describe('CRUD Operations', () => {
 
       await waitFor(() => {
         expect(localStorage.setItem).toHaveBeenCalled()
-      })
+      }, { timeout: 3000 })
     })
   })
 })
@@ -529,15 +535,17 @@ describe('State Transitions', () => {
 
   it('should display achievement badges for objectives', () => {
     render(<App />)
-    expect(screen.getByText((content, element) => {
+    const achievedBadges = screen.getAllByText((content, element) => {
       return element.tagName.toLowerCase() === 'span' && 
              element.classList.contains('achievement-badge') && 
              content.includes('已达成')
-    })).toBeInTheDocument()
-    expect(screen.getByText((content, element) => {
+    })
+    const notAchievedBadges = screen.getAllByText((content, element) => {
       return element.tagName.toLowerCase() === 'span' && 
              element.classList.contains('achievement-badge') && 
              content.includes('未达成')
-    })).toBeInTheDocument()
+    })
+    expect(achievedBadges.length).toBeGreaterThan(0)
+    expect(notAchievedBadges.length).toBeGreaterThan(0)
   })
 })

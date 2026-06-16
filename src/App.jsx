@@ -1,6 +1,13 @@
-import { useState, useEffect, useCallback } from 'react'
-import { saveToStorage, loadFromStorage, getStorageInfo, getStorageEvictionLog } from './utils/storage'
-import { syncService, syncStatus, conflictResolution, useSync } from './utils/syncApi'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import {
+  saveToStorage, loadFromStorage, getStorageInfo, getStorageEvictionLog,
+  setStorageMode, getStorageMode, setConfig as setStorageConfig, getConfig as getStorageConfig
+} from './utils/storage'
+import {
+  syncService, syncStatus, conflictResolution, useSync,
+  ConfluenceAuthProvider, NotionAuthProvider,
+  ConfluenceAuthMethod, NotionAuthMethod, driftUtils
+} from './utils/syncApi'
 import {
   formatDate,
   formatDateTime,
@@ -12,6 +19,12 @@ import {
   calculateDowntimeFromSlo,
   createSloComposite,
   createRtoComposite,
+  createSli,
+  sliTypes,
+  formatSli,
+  isSliMet,
+  validateSli,
+  createSloWithSlis,
   createShiftRotation,
   severityConfig,
   getEscalationPath,
@@ -19,7 +32,15 @@ import {
   canReopenActionItem,
   buildActionItemReopenHistory,
   holidayPriorityLevels,
-  getOnCallPerson
+  getOnCallPerson,
+  calendarProviders,
+  CalendarSyncService,
+  MlSeverityLearner,
+  defaultRuntimeConfig,
+  RuntimeConfigService,
+  Role,
+  permissions,
+  clockDriftUtils
 } from './utils/helpers'
 import ScenarioSidebar from './components/ScenarioSidebar'
 import ParticipantsPanel from './components/ParticipantsPanel'
@@ -40,7 +61,7 @@ const initialData = [
     name: '数据库故障应急演练',
     description: '模拟主数据库宕机，验证故障切换流程和数据恢复能力',
     date: '2026-06-10',
-    expectedSlo: createSloComposite(99.9, 30, 'day'),
+    expectedSlo: createSloWithSlis({ percent: 99.9, windowValue: 30, windowUnit: 'day' }),
     actualRto: createRtoComposite(5, 'minute', 8, 'minute'),
     updatedAt: '2026-06-10T18:00:00Z',
     objectives: [
@@ -218,14 +239,8 @@ const tabs = [
 ]
 
 function App() {
-  const [scenarios, setScenarios] = useState(() => {
-    const saved = loadFromStorage()
-    return saved && saved.length > 0 ? saved : initialData
-  })
-  const [activeScenarioId, setActiveScenarioId] = useState(() => {
-    const saved = loadFromStorage()
-    return saved && saved.length > 0 ? saved[0].id : initialData[0].id
-  })
+  const [scenarios, setScenarios] = useState(initialData)
+  const [activeScenarioId, setActiveScenarioId] = useState(initialData[0].id)
   const [draggedIssue, setDraggedIssue] = useState(null)
   const [activeTab, setActiveTab] = useState('kanban')
 
@@ -245,23 +260,80 @@ function App() {
     scenario: { isOpen: false, data: null },
     participant: { isOpen: false, data: null },
     issue: { isOpen: false, data: null, defaultStatus: 'todo' },
-    actionItem: { isOpen: false, data: null, defaultStatus: 'pending' }
+    actionItem: { isOpen: false, data: null, defaultStatus: 'pending' },
+    adminConfig: { isOpen: false },
+    calendarSync: { isOpen: false }
   })
+
+  const [runtimeConfig, setRuntimeConfigState] = useState(defaultRuntimeConfig)
+  const runtimeSvc = useRef(null)
+  const calendarSvc = useRef(null)
+  const [currentUser, setCurrentUser] = useState({ id: 'u-admin-demo', name: '系统管理员', role: Role.ADMIN })
+  const [calendarState, setCalendarState] = useState({
+    holidays: [],
+    shifts: [],
+    lastSyncAt: null,
+    syncing: false,
+    provider: calendarProviders.MOCK
+  })
+  const [mlState, setMlState] = useState({
+    sampleCount: 0,
+    suggestion: null,
+    learnedApplied: false
+  })
+  const [bootReady, setBootReady] = useState(false)
+
+  /* --- 启动阶段：async 加载存储 + 服务初始化 --- */
+  useEffect(() => {
+    let cancelled = false
+    const boot = async () => {
+      try {
+        runtimeSvc.current = new RuntimeConfigService(
+          { getConfig: getStorageConfig, setConfig: setStorageConfig },
+          defaultRuntimeConfig
+        )
+        runtimeSvc.current.setCurrentUser(currentUser)
+        const loadCfg = runtimeSvc.current.load()
+        const savedData = await loadFromStorage()
+        const cfgRes = await loadCfg
+        if (!cancelled) {
+          if (cfgRes.ok) setRuntimeConfigState(runtimeSvc.current.config)
+          if (savedData && savedData.length > 0) {
+            setScenarios(savedData)
+            setActiveScenarioId(savedData[0].id)
+          }
+          calendarSvc.current = new CalendarSyncService(calendarState.provider)
+          setBootReady(true)
+        }
+      } catch (e) {
+        console.error('[App] 启动异常:', e)
+        setBootReady(true)
+      }
+    }
+    boot()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     return syncService.subscribe(setSyncState)
   }, [])
 
   useEffect(() => {
-    if (scenarios.length > 0) {
-      const result = saveToStorage(scenarios)
+    if (!bootReady || scenarios.length === 0) return
+    let cancelled = false
+    const persist = async () => {
+      const result = await saveToStorage(scenarios)
+      if (cancelled) return
       if (result?.evicted && result.evicted.length > 0) {
         setEvictionNotice(result)
         setStorageBannerVisible(true)
       }
       setStorageInfo(getStorageInfo())
     }
-  }, [scenarios])
+    persist()
+    return () => { cancelled = true }
+  }, [scenarios, bootReady])
 
   useEffect(() => {
     if (syncState.status === syncStatus.CONFLICT && syncState.pendingConflicts > 0) {
@@ -280,7 +352,7 @@ function App() {
     let syncTimeout
     const scheduleSync = () => {
       syncTimeout = setTimeout(async () => {
-        if (scenarios.length > 0) {
+        if (scenarios.length > 0 && bootReady) {
           setIsSyncing(true)
           await syncService.push(scenarios)
           setIsSyncing(false)
@@ -288,9 +360,58 @@ function App() {
         scheduleSync()
       }, 30000)
     }
-    scheduleSync()
+    if (bootReady) scheduleSync()
     return () => clearTimeout(syncTimeout)
-  }, [scenarios])
+  }, [scenarios, bootReady])
+
+  /* --- 日历同步 --- */
+  const handleCalendarSync = async () => {
+    if (!calendarSvc.current) return
+    setCalendarState(s => ({ ...s, syncing: true }))
+    const svc = calendarSvc.current
+    await svc.authenticate('demo-mock-token')
+    const year = new Date().getFullYear()
+    const holidaysRes = await svc.fetchHolidays(year)
+    const from = new Date()
+    const to = new Date(Date.now() + 30 * 86400_000)
+    const shiftsRes = await svc.fetchOnCallCalendar('demo-cal', from.toISOString(), to.toISOString())
+    setCalendarState(s => ({
+      ...s,
+      holidays: holidaysRes.holidays || [],
+      shifts: shiftsRes.shifts || [],
+      lastSyncAt: new Date().toISOString(),
+      syncing: false
+    }))
+  }
+
+  /* --- ML 严重度学习 --- */
+  const handleCollectMlSamples = () => {
+    let count = 0
+    scenarios.forEach(s => {
+      (s.issues || []).forEach(issue => {
+        const dur = (new Date(issue.updatedAt || issue.createdAt || s.date) - new Date(issue.createdAt || s.date)) / 60000
+        const sug = MlSeverityLearner.addSample(issue, Math.max(2, Math.abs(dur || 15)), issue.status)
+        count++
+        if (sug) setMlState(st => ({ ...st, suggestion: sug }))
+      })
+    })
+    setMlState(st => ({ ...st, sampleCount: MlSeverityLearner.samples.length }))
+    return { collected: count }
+  }
+
+  const handleApplyMlSuggestion = () => {
+    if (!mlState.suggestion) return
+    MlSeverityLearner.applyLearnedThresholds(severityConfig, mlState.suggestion)
+    setMlState(st => ({ ...st, learnedApplied: true }))
+  }
+
+  /* --- 管理员配置保存 --- */
+  const saveAdminConfig = async (partial) => {
+    if (!runtimeSvc.current) return { ok: false, error: '服务未就绪' }
+    const res = await runtimeSvc.current.save(partial, currentUser)
+    if (res.ok) setRuntimeConfigState({ ...runtimeSvc.current.config })
+    return res
+  }
 
   const activeScenario = scenarios.find((s) => s.id === activeScenarioId)
 
@@ -492,6 +613,9 @@ function App() {
   const handleActionItemStatusChange = (actionItemId, newStatus) => {
     const now = new Date().toISOString()
     const isCompleted = newStatus === 'completed' || newStatus === 'verified'
+    const maxReopen = runtimeConfig.actionItem?.maxReopen
+    const cooldownHours = runtimeConfig.actionItem?.reopenCooldownHours
+    const allowForce = runtimeSvc.current?.canForceReopen() || currentUser.role === Role.ADMIN
 
     updateScenario(activeScenarioId, (scenario) => {
       const target = scenario.actionItems.find(a => a.id === actionItemId)
@@ -501,8 +625,11 @@ function App() {
       const isReopening = wasCompleted && !isCompleted
 
       if (isReopening) {
-        const check = canReopenActionItem(target)
-        if (!check.allowed) {
+        const check = canReopenActionItem(target, {
+          maxReopen: maxReopen != null ? maxReopen : 5,
+          cooldownHours: cooldownHours != null ? cooldownHours : 24
+        })
+        if (!check.allowed && !allowForce) {
           alert(check.reason)
           return scenario
         }
@@ -523,7 +650,7 @@ function App() {
               ...base,
               reopenCount: (a.reopenCount || 0) + 1,
               lastReopenAt: now,
-              reopenHistory: [...(a.reopenHistory || []), { at: now, reason: '用户手动重开' }]
+              reopenHistory: [...(a.reopenHistory || []), { at: now, reason: allowForce ? '管理员强制重开' : '用户手动重开', forced: allowForce }]
             }
           }
           return base
@@ -705,6 +832,20 @@ function App() {
                     )}
                   </div>
                 )}
+                {activeScenario.expectedSlo?.slis?.length > 0 && (
+                  <div className="sli-card" title={`包含 ${activeScenario.expectedSlo.slis.length} 项 SLI 指标`}>
+                    <div className="sli-title">📊 SLI 指标</div>
+                    {activeScenario.expectedSlo.slis.filter(s => s.enabled).slice(0, 4).map(sli => {
+                      const met = isSliMet(sli)
+                      return (
+                        <div key={sli.id} className={`sli-row ${met === true ? 'ok' : met === false ? 'bad' : ''}`}>
+                          <span className="sli-name">{formatSli(sli).slice(0, 30)}</span>
+                          <span className="sli-state">{met === true ? '✅' : met === false ? '❌' : '⏳'}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
                 {onCallInfo?.person && (
                   <div className="oncall-card" style={{ borderColor: holidayPriorityLevels.find(h => h.level === onCallInfo.priority)?.color }}>
                     <div className="oncall-title">📞 当前值班（{onCallInfo.priorityLabel}）</div>
@@ -775,6 +916,26 @@ function App() {
                 <span className="stat-label">已解决</span>
                 <span className="stat-value">{stats.resolved}</span>
               </div>
+            </div>
+            <div className="admin-toolbar">
+              <div className="user-chip" title={`角色: ${currentUser.role}`}>
+                <span className="user-avatar">👤</span>
+                <span className="user-name">{currentUser.name}</span>
+                <span className={`user-role role-${currentUser.role}`}>{currentUser.role}</span>
+              </div>
+              <button className="admin-btn" onClick={() => setModalState(m => ({ ...m, calendarSync: { ...m.calendarSync, isOpen: true } }))}>
+                📅 日历同步{calendarState.lastSyncAt ? `✓` : ''}
+              </button>
+              <button className={`admin-btn ${mlState.sampleCount > 0 ? 'active' : ''}`}
+                      onClick={() => {
+                        const r = handleCollectMlSamples()
+                        if (mlState.suggestion) handleApplyMlSuggestion()
+                      }}>
+                🧠 ML{mlState.sampleCount > 0 && ` (${mlState.sampleCount})`}
+              </button>
+              <button className="admin-btn admin" onClick={() => setModalState(m => ({ ...m, adminConfig: { ...m.adminConfig, isOpen: true } }))}>
+                ⚙️ 配置
+              </button>
             </div>
           </div>
         </header>
@@ -885,13 +1046,13 @@ function App() {
 
             {activeTab === 'timeline' && (
               <div className="timeline-section">
-                <Timeline scenario={activeScenario} />
+                <Timeline scenario={activeScenario} runtimeConfig={runtimeConfig} />
               </div>
             )}
 
             {activeTab === 'graph' && (
               <div className="graph-section">
-                <DependencyGraph scenario={activeScenario} />
+                <DependencyGraph scenario={activeScenario} runtimeConfig={runtimeConfig} />
               </div>
             )}
           </div>
@@ -1037,6 +1198,201 @@ function App() {
               <span className="resolution-sub">关闭弹窗手动比较</span>
             </button>
           </div>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={modalState.adminConfig.isOpen}
+        onClose={() => closeModal('adminConfig')}
+        title="⚙️ 管理员运行时配置"
+        size="large"
+      >
+        <div className="admin-config">
+          <div className="admin-section">
+            <h4>🔁 Action Item 重开配置</h4>
+            <div className="config-row">
+              <label>最大重开次数 (MAX_REOPEN)</label>
+              <input type="number" min="0" max="99"
+                     defaultValue={runtimeConfig.actionItem.maxReopen}
+                     onBlur={(e) => saveAdminConfig({ actionItem: { maxReopen: Math.max(0, parseInt(e.target.value) || 0) } })} />
+            </div>
+            <div className="config-row">
+              <label>冷却期 (小时)</label>
+              <input type="number" min="0" max="720" step="1"
+                     defaultValue={runtimeConfig.actionItem.reopenCooldownHours}
+                     onBlur={(e) => saveAdminConfig({ actionItem: { reopenCooldownHours: Math.max(0, parseInt(e.target.value) || 0) } })} />
+            </div>
+          </div>
+
+          <div className="admin-section">
+            <h4>🔄 同步 & 时钟漂移</h4>
+            <div className="config-row">
+              <label>最大重试次数</label>
+              <input type="number" min="0" max="20"
+                     defaultValue={runtimeConfig.sync.maxRetries}
+                     onBlur={(e) => saveAdminConfig({ sync: { maxRetries: Math.max(0, parseInt(e.target.value) || 0) } })} />
+            </div>
+            <div className="config-row">
+              <label>时钟漂移容忍区间 (ms)</label>
+              <input type="number" min="0" max="60000" step="500"
+                     defaultValue={runtimeConfig.sync.clockDriftToleranceMs}
+                     onBlur={(e) => {
+                       const v = Math.max(0, parseInt(e.target.value) || 0)
+                       driftUtils.toleranceMs = v
+                       clockDriftUtils.DEFAULT_TOLERANCE_MS = v
+                       saveAdminConfig({ sync: { clockDriftToleranceMs: v } })
+                     }} />
+            </div>
+            <div className="config-row">
+              <label>离线判定超时 (ms)</label>
+              <input type="number" min="1000" max="60000" step="1000"
+                     defaultValue={runtimeConfig.sync.offlineTimeoutMs}
+                     onBlur={(e) => saveAdminConfig({ sync: { offlineTimeoutMs: Math.max(1000, parseInt(e.target.value) || 10000) } })} />
+            </div>
+          </div>
+
+          <div className="admin-section">
+            <h4>💾 存储 & 性能</h4>
+            <div className="config-row">
+              <label>本地存储配额 (MB，1~10)</label>
+              <input type="number" min="1" max="10" step="1"
+                     defaultValue={runtimeConfig.storage.localStorageQuotaMB}
+                     onBlur={(e) => saveAdminConfig({ storage: { localStorageQuotaMB: Math.min(10, Math.max(1, parseInt(e.target.value) || 4)) } })} />
+            </div>
+            <div className="config-row">
+              <label>启用 IndexedDB Fallback</label>
+              <input type="checkbox"
+                     defaultChecked={runtimeConfig.storage.useIndexedDBFallback}
+                     onChange={(e) => {
+                       saveAdminConfig({ storage: { useIndexedDBFallback: e.target.checked } })
+                       setStorageMode(e.target.checked ? 'auto' : 'localStorage')
+                     }} />
+              <span className="muted">当前: {getStorageMode()} · IDB可用: {storageInfo.idbAvailable ? '是' : '否'}</span>
+            </div>
+            <div className="config-row">
+              <label>移动端触摸优化 (passive + rAF)</label>
+              <input type="checkbox"
+                     defaultChecked={runtimeConfig.timeline.enableTouchOptimization}
+                     onChange={(e) => saveAdminConfig({ timeline: { enableTouchOptimization: e.target.checked } })} />
+            </div>
+            <div className="config-row">
+              <label>依赖图列层虚拟化</label>
+              <input type="checkbox"
+                     defaultChecked={runtimeConfig.depGraph.columnVirtualization}
+                     onChange={(e) => saveAdminConfig({ depGraph: { columnVirtualization: e.target.checked } })} />
+            </div>
+          </div>
+
+          <div className="admin-section">
+            <h4>👥 角色与权限</h4>
+            <div className="config-row">
+              <label>当前用户角色</label>
+              <select defaultValue={currentUser.role}
+                      onChange={(e) => setCurrentUser(u => ({ ...u, role: e.target.value }))}>
+                {Object.entries(Role).map(([k, v]) => (
+                  <option key={v} value={v}>{k} ({v})</option>
+                ))}
+              </select>
+            </div>
+            <div className="perm-preview">
+              <div className="perm-title">权限预览：</div>
+              {Object.entries(permissions).map(([key, roles]) => (
+                <div key={key} className="perm-row">
+                  <span>{key}</span>
+                  <span className={runtimeSvc.current?.can(currentUser.role, key) ? 'perm-ok' : 'perm-no'}>
+                    {runtimeSvc.current?.can(currentUser.role, key) ? '✓ 允许' : '✗ 禁止'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="admin-section config-meta">
+            <div>版本 v{runtimeConfig._meta?.version || 1} · 更新于 {formatDateTime(runtimeConfig._meta?.updatedAt)}</div>
+            <div>更新人: {runtimeConfig._meta?.updatedBy || 'system'}</div>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={modalState.calendarSync.isOpen}
+        onClose={() => closeModal('calendarSync')}
+        title="📅 企业日历同步"
+        size="medium"
+      >
+        <div className="calendar-sync">
+          <div className="config-row">
+            <label>日历 Provider</label>
+            <select defaultValue={calendarState.provider.id}
+                    onChange={(e) => {
+                      const p = Object.values(calendarProviders).find(x => x.id === e.target.value) || calendarProviders.MOCK
+                      setCalendarState(s => ({ ...s, provider: p }))
+                      if (calendarSvc.current) calendarSvc.current.provider = p
+                    }}>
+              {Object.values(calendarProviders).map(p => (
+                <option key={p.id} value={p.id}>{p.name} ({p.auth})</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="config-row">
+            <label>同步状态</label>
+            <span>
+              {calendarState.syncing ? '⏳ 同步中...' : (calendarState.lastSyncAt ? `✓ 已同步于 ${formatDateTime(calendarState.lastSyncAt)}` : '未同步')}
+            </span>
+          </div>
+
+          <div className="calendar-actions">
+            <button className="btn primary" onClick={handleCalendarSync} disabled={calendarState.syncing}>
+              🔄 立即同步
+            </button>
+          </div>
+
+          {calendarState.holidays.length > 0 && (
+            <div className="holiday-list">
+              <h4>🎊 已同步假期 ({calendarState.holidays.length})</h4>
+              <ul>
+                {calendarState.holidays.slice(0, 8).map(h => (
+                  <li key={`${h.date}-${h.name}`} className={`holiday-item type-${h.type}`}>
+                    <span className="holiday-date">{h.date}</span>
+                    <span className="holiday-name">{h.name}</span>
+                    <span className="holiday-type">{h.type}</span>
+                  </li>
+                ))}
+                {calendarState.holidays.length > 8 && (
+                  <li className="more-field">...以及 {calendarState.holidays.length - 8} 个假期</li>
+                )}
+              </ul>
+            </div>
+          )}
+
+          {calendarState.shifts.length > 0 && (
+            <div className="shift-list">
+              <h4>👥 未来 7 天值班</h4>
+              <ul>
+                {calendarState.shifts.slice(0, 7).map(s => (
+                  <li key={s.id} className="shift-item">
+                    <span className="shift-date">{s.date}</span>
+                    <span className="shift-primary">主班: {s.primary}</span>
+                    <span className="shift-secondary">副班: {s.secondary}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {mlState.sampleCount > 0 && (
+            <div className="ml-info">
+              <h4>🧠 ML 严重度学习</h4>
+              <div>已采集样本: {mlState.sampleCount}</div>
+              {mlState.suggestion && (
+                <div>
+                  <div>最近建议: P95 时长阈值已学习 (样本 {mlState.suggestion.sampleCount})</div>
+                  <div>生效状态: {mlState.learnedApplied ? '✓ 已应用到严重度配置' : '未应用'}</div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </Modal>
     </div>

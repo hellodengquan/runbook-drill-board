@@ -1,16 +1,22 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { generateDependencyGraph, severityConfig, statusConfig, actionItemStatusConfig } from '../utils/helpers'
 
-export default function DependencyGraph({ scenario }) {
+const DEFAULT_COLUMN_GAP = 240
+
+export default function DependencyGraph({ scenario, runtimeConfig }) {
   const graphData = useMemo(() => generateDependencyGraph(scenario, { enableOptimization: true }), [scenario])
   const [hoveredNode, setHoveredNode] = useState(null)
   const [selectedNode, setSelectedNode] = useState(null)
   const [useClustered, setUseClustered] = useState(graphData.clustered)
+  const [columnVirtEnabled, setColumnVirtEnabled] = useState(
+    runtimeConfig?.depGraph?.columnVirtualization !== false
+  )
   const svgRef = useRef(null)
   const panState = useRef({ startX: 0, startY: 0, viewBoxX: 0, viewBoxY: 0 })
   const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 800, h: 550 })
   const [isPanning, setIsPanning] = useState(false)
   const touchRef = useRef({ pinchDist: 0, initialView: null })
+  const maxNodesFullView = runtimeConfig?.depGraph?.maxNodesFullView ?? 300
 
   const displayData = useMemo(() => {
     if (useClustered && !graphData.clustered) return graphData
@@ -28,6 +34,45 @@ export default function DependencyGraph({ scenario }) {
     const padding = 40
     setViewBox({ x: -padding, y: -padding, w: svgWidth + padding * 2, h: svgHeight + padding * 2 })
   }, [svgWidth, svgHeight])
+
+  const columnsInfo = useMemo(() => {
+    const byLayer = {}
+    nodes.forEach(n => {
+      const layer = n.layer ?? 0
+      if (!byLayer[layer]) byLayer[layer] = { nodes: [], minX: Infinity, maxX: -Infinity }
+      byLayer[layer].nodes.push(n)
+      byLayer[layer].minX = Math.min(byLayer[layer].minX, n.x - 110)
+      byLayer[layer].maxX = Math.max(byLayer[layer].maxX, n.x + 110)
+    })
+    return Object.values(byLayer).sort((a, b) => a.minX - b.minX).map(col => ({
+      ...col,
+      columnId: col.nodes[0]?.layer ?? col.minX
+    }))
+  }, [nodes])
+
+  const visibleNodeIds = useMemo(() => {
+    if (!columnVirtEnabled || columnsInfo.length <= 4 || nodes.length <= maxNodesFullView) {
+      return null
+    }
+    const padX = viewBox.w * 0.4
+    const vxMin = viewBox.x - padX
+    const vxMax = viewBox.x + viewBox.w + padX
+    const ids = new Set()
+    columnsInfo.forEach(col => {
+      if (col.maxX >= vxMin && col.minX <= vxMax) {
+        col.nodes.forEach(n => ids.add(n.id))
+      }
+    })
+    return ids
+  }, [columnsInfo, viewBox, columnVirtEnabled, nodes.length, maxNodesFullView])
+
+  const displayedNodes = visibleNodeIds
+    ? nodes.filter(n => visibleNodeIds.has(n.id))
+    : nodes
+  const displayedNodeSet = useMemo(() => new Set(displayedNodes.map(n => n.id)), [displayedNodes])
+  const displayedLinks = visibleNodeIds
+    ? links.filter(l => displayedNodeSet.has(l.source) && displayedNodeSet.has(l.target))
+    : links
 
   const getNodeColor = (node) => {
     if (node.type === 'cluster') {
@@ -151,12 +196,6 @@ export default function DependencyGraph({ scenario }) {
 
   const onTouchEnd = () => { touchRef.current.pinchDist = 0 }
 
-  const maxVisibleNodes = 1000
-  const shouldUseVirtualization = nodes.length > maxVisibleNodes
-  const displayedNodes = shouldUseVirtualization ? nodes.slice(0, maxVisibleNodes) : nodes
-  const nodeIds = new Set(displayedNodes.map(n => n.id))
-  const displayedLinks = shouldUseVirtualization ? links.filter(l => nodeIds.has(l.source) && nodeIds.has(l.target)) : links
-
   return (
     <div className="dependency-graph">
       <div className="dg-toolbar">
@@ -164,12 +203,16 @@ export default function DependencyGraph({ scenario }) {
           <input type="checkbox" checked={useClustered} onChange={e => setUseClustered(e.target.checked)} />
           <span>聚合模式（节点超过50）</span>
         </label>
+        <label className="dg-toggle">
+          <input type="checkbox" checked={columnVirtEnabled} onChange={e => setColumnVirtEnabled(e.target.checked)} />
+          <span>列层虚拟化（大量节点）</span>
+        </label>
         <button className="dg-btn" onClick={() => setViewBox({ x: -40, y: -40, w: svgWidth + 80, h: svgHeight + 80 })}>重置视图</button>
         <span className="dg-stats">
           节点 {displayData.stats?.total || nodes.length}
-          {displayData.stats?.displayed && displayData.stats.displayed !== displayData.stats.total &&
-            ` / 展示 ${displayData.stats.displayed}`}
+          {visibleNodeIds && ` / 渲染 ${displayedNodes.length}`}
           {' '}· 连线 {links.length}
+          {' '}· 列 {columnsInfo.length}
         </span>
       </div>
 
@@ -197,6 +240,21 @@ export default function DependencyGraph({ scenario }) {
         </defs>
 
         <rect x={viewBox.x - 10000} y={viewBox.y - 10000} width={viewBox.w + 20000} height={viewBox.h + 20000} fill="url(#gridPattern)" />
+
+        {columnVirtEnabled && visibleNodeIds && columnsInfo.map((col, i) => {
+          if (col.maxX < viewBox.x || col.minX > viewBox.x + viewBox.w) return null
+          return (
+            <rect
+              key={`col-${i}`}
+              x={col.minX}
+              y={-50}
+              width={Math.max(0, col.maxX - col.minX)}
+              height={svgHeight + 100}
+              fill={i % 2 === 0 ? 'rgba(99,102,241,0.03)' : 'rgba(6,182,212,0.02)'}
+              stroke="none"
+            />
+          )
+        })}
 
         <g className="links-layer">
           {displayedLinks.map((link, i) => {

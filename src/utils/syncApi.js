@@ -84,6 +84,108 @@ const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 30000
 const MAX_RETRIES = 5
 
+/* ============================================
+   时钟漂移容忍 + 断线超时 + 快照合并 扩展
+   ============================================ */
+
+const DEFAULT_CLOCK_DRIFT_TOLERANCE_MS = 5000
+const DEFAULT_OFFLINE_TIMEOUT_MS = 10000
+const OFFLINE_SNAPSHOT_KEY = 'drill-board-offline-snapshot'
+
+export const driftUtils = {
+  toleranceMs: DEFAULT_CLOCK_DRIFT_TOLERANCE_MS,
+  localClockOffsetMs: 0,
+  calibrate(serverTsMs) {
+    if (serverTsMs) {
+      this.localClockOffsetMs = serverTsMs - Date.now()
+    }
+  },
+  now() {
+    return Date.now() + this.localClockOffsetMs
+  },
+  within(localTs, remoteTs, tolerance = this.toleranceMs) {
+    return Math.abs((localTs || 0) - (remoteTs || 0)) <= tolerance
+  }
+}
+
+const classifyConflict = (localVersion, remoteVersion, localUpdatedAt, remoteUpdatedAt, tolerance = DEFAULT_CLOCK_DRIFT_TOLERANCE_MS) => {
+  if (localVersion === remoteVersion) return { kind: 'same', autoMerge: true }
+  if (localVersion > remoteVersion) return { kind: 'local-newer', autoMerge: true, prefer: 'local' }
+  if (Math.abs(localVersion - remoteVersion) === 1 && driftUtils.within(localUpdatedAt, remoteUpdatedAt, tolerance)) {
+    return { kind: 'drift-tolerant', autoMerge: true, prefer: 'merge' }
+  }
+  if (driftUtils.within(localUpdatedAt, remoteUpdatedAt, tolerance * 2)) {
+    return { kind: 'minor-drift', autoMerge: true, prefer: 'merge' }
+  }
+  return { kind: 'conflict', autoMerge: false }
+}
+
+const readOfflineSnapshot = () => {
+  try {
+    const raw = localStorage.getItem(OFFLINE_SNAPSHOT_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch { return null }
+}
+
+const writeOfflineSnapshot = (data, version, capturedAt, offlineSince) => {
+  try {
+    localStorage.setItem(OFFLINE_SNAPSHOT_KEY, JSON.stringify({ data, version, capturedAt, offlineSince }))
+    return true
+  } catch { return false }
+}
+
+const clearOfflineSnapshot = () => {
+  try { localStorage.removeItem(OFFLINE_SNAPSHOT_KEY) } catch {}
+}
+
+const tripleMerge = (snapshotData, offlineQueueData, remoteData) => {
+  const all = [snapshotData, offlineQueueData, remoteData].filter(Boolean)
+  if (all.length === 0) return []
+  if (all.length === 1) return all[0]
+  const idMap = new Map()
+  all.forEach(list => (list || []).forEach(item => {
+    const cur = idMap.get(item.id)
+    if (!cur) { idMap.set(item.id, { ...item }) }
+    else {
+      const curU = cur.updatedAt || cur.date || 0
+      const itU = item.updatedAt || item.date || 0
+      if (itU > curU) idMap.set(item.id, { ...item })
+    }
+  }))
+  return [...idMap.values()]
+}
+
+const offlineTimeoutSnapshot = {
+  offlineSince: null,
+  snapshot: null,
+  markOffline(data, version) {
+    if (!this.offlineSince) {
+      this.offlineSince = Date.now()
+      this.snapshot = { data: JSON.parse(JSON.stringify(data || [])), version }
+      writeOfflineSnapshot(this.snapshot.data, this.snapshot.version, Date.now(), this.offlineSince)
+    }
+  },
+  isTimedOut(timeoutMs = DEFAULT_OFFLINE_TIMEOUT_MS) {
+    if (!this.offlineSince) return false
+    return Date.now() - this.offlineSince >= timeoutMs
+  },
+  markOnline() {
+    this.offlineSince = null
+    this.snapshot = null
+    clearOfflineSnapshot()
+  },
+  resolve(timeoutMs = DEFAULT_OFFLINE_TIMEOUT_MS, offlineQueueData, remoteData) {
+    const needMerge = this.isTimedOut(timeoutMs)
+    if (needMerge && this.snapshot) {
+      const merged = tripleMerge(this.snapshot.data, offlineQueueData, remoteData)
+      this.markOnline()
+      return { merged, via: 'triple-merge' }
+    }
+    this.markOnline()
+    return { merged: null, via: 'no-timeout' }
+  }
+}
+
 export class SyncService {
   constructor() {
     this.subscribers = new Set()
@@ -174,11 +276,12 @@ export class SyncService {
 
   async push(data, attempt = 0) {
     if (!this.isOnline) {
+      offlineTimeoutSnapshot.markOffline(data, this.version)
       this.offlineQueue.push({ op: 'push', payload: { data, stubVersion: nextVersion() }, queuedAt: Date.now() })
       writeOfflineQueue(this.offlineQueue)
       this.status = syncStatus.OFFLINE
       this.notify()
-      return { success: true, offline: true, queued: true }
+      return { success: true, offline: true, queued: true, offlineSince: offlineTimeoutSnapshot.offlineSince }
     }
 
     this.status = syncStatus.SYNCING
@@ -191,15 +294,24 @@ export class SyncService {
       const remote = readRemote()
       const localVersion = this.version
       const remoteVersion = remote?.version || 0
+      const localUpdatedAt = Array.isArray(data) && data.length
+        ? Math.max(...data.map(s => new Date(s.updatedAt || s.date || 0).getTime()))
+        : 0
+      const remoteUpdatedAt = Array.isArray(remote?.data) && remote.data.length
+        ? Math.max(...remote.data.map(s => new Date(s.updatedAt || s.date || 0).getTime()))
+        : 0
 
-      if (remote && remoteVersion > localVersion) {
+      const conflictClass = classifyConflict(localVersion, remoteVersion, localUpdatedAt, remoteUpdatedAt)
+
+      if (conflictClass.kind === 'conflict') {
         this.status = syncStatus.CONFLICT
         this.pendingConflicts.push({
           localVersion,
           remoteVersion,
           localData: data,
           remoteData: remote.data,
-          reportedAt: Date.now()
+          reportedAt: Date.now(),
+          kind: conflictClass.kind
         })
         this.notify()
         return {
@@ -211,17 +323,22 @@ export class SyncService {
         }
       }
 
+      if (conflictClass.autoMerge && conflictClass.prefer === 'merge' && remote?.data) {
+        data = mergeScenarios(data, remote.data)
+      }
+
       const newVersion = nextVersion()
       const syncedAt = new Date().toISOString()
       const written = writeRemote(data, newVersion, syncedAt)
       if (!written) throw new Error('远程存储写入失败')
 
+      offlineTimeoutSnapshot.markOnline()
       this.version = newVersion
       this.retryCount = 0
       this.status = syncStatus.SUCCESS
       this.lastSyncTime = syncedAt
       this.notify()
-      return { success: true, syncedAt, version: newVersion }
+      return { success: true, syncedAt, version: newVersion, autoMerged: conflictClass.autoMerge && conflictClass.kind !== 'same' }
     } catch (error) {
       return this._scheduleRetry(this.push, data, (attempt || 0) + 1)
     }
@@ -286,10 +403,31 @@ export class SyncService {
     }
   }
 
-  async _drainOfflineQueue() {
-    if (this.offlineQueue.length === 0) return
+  async _drainOfflineQueue(timeoutMs = DEFAULT_OFFLINE_TIMEOUT_MS) {
+    if (this.offlineQueue.length === 0) {
+      offlineTimeoutSnapshot.markOnline()
+      return
+    }
     this.status = syncStatus.RETRYING
     this.notify()
+
+    const offlineQueueData = this.offlineQueue
+      .filter(x => x.op === 'push')
+      .flatMap(x => x.payload.data || [])
+
+    const remote = readRemote()
+    const snapshotResult = offlineTimeoutSnapshot.resolve(timeoutMs, offlineQueueData, remote?.data)
+    if (snapshotResult.merged) {
+      const newVersion = nextVersion()
+      writeRemote(snapshotResult.merged, newVersion, new Date().toISOString())
+      this.version = newVersion
+      this.offlineQueue = []
+      writeOfflineQueue(this.offlineQueue)
+      this.status = syncStatus.SUCCESS
+      this.notify()
+      return { via: snapshotResult.via, count: snapshotResult.merged.length, version: newVersion }
+    }
+
     const queue = [...this.offlineQueue]
     const processed = []
     for (const item of queue) {
@@ -308,8 +446,8 @@ export class SyncService {
     }
   }
 
-  flushOfflineQueue() {
-    return this._drainOfflineQueue()
+  flushOfflineQueue(timeoutMs) {
+    return this._drainOfflineQueue(timeoutMs)
   }
 
   clearOfflineQueue() {
@@ -365,5 +503,201 @@ export const useSync = () => {
     isError: syncState.status === syncStatus.ERROR,
     isOffline: syncState.status === syncStatus.OFFLINE,
     hasConflict: syncState.pendingConflicts > 0
+  }
+}
+
+/* ============================================
+   Confluence / Notion 鉴权适配层
+   ============================================ */
+
+export const authProviderType = {
+  CONFLUENCE: 'confluence',
+  NOTION: 'notion'
+}
+
+export const ConfluenceAuthMethod = {
+  BASIC: 'basic',
+  PAT: 'personal_access_token',
+  OAUTH2: 'oauth2_3lo',
+  SWIFT: 'swift_app'
+}
+
+export const NotionAuthMethod = {
+  INTERNAL: 'internal_integration_token',
+  OAUTH: 'public_oauth'
+}
+
+class ExportAuthProvider {
+  constructor(type) {
+    this.type = type
+    this.credentials = null
+    this.endpoint = null
+    this.tokenType = null
+    this.scope = null
+  }
+
+  isConfigured() { return !!this.credentials }
+  invalidate() { this.credentials = null }
+
+  buildHeaders() {
+    throw new Error('子类需实现 buildHeaders()')
+  }
+
+  async refreshIfNeeded() {
+    return { ok: false, error: '未实现' }
+  }
+
+  async request(path, { method = 'GET', body = null, extraHeaders = {} } = {}) {
+    if (!this.endpoint) return { ok: false, error: '未配置 endpoint' }
+    if (!this.isConfigured()) return { ok: false, error: '未配置凭据' }
+    try {
+      const resp = await fetch(`${this.endpoint}${path}`, {
+        method,
+        headers: { ...this.buildHeaders(), ...extraHeaders },
+        body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null
+      })
+      const ok = resp.ok
+      const data = resp.headers.get('content-type')?.includes('json')
+        ? await resp.json()
+        : await resp.text()
+      return ok ? { ok: true, data, status: resp.status } : { ok: false, status: resp.status, data }
+    } catch (e) {
+      return { ok: false, error: e.message }
+    }
+  }
+}
+
+export class ConfluenceAuthProvider extends ExportAuthProvider {
+  constructor(baseUrl, method = ConfluenceAuthMethod.PAT) {
+    super(authProviderType.CONFLUENCE)
+    this.baseUrl = baseUrl || 'https://your-domain.atlassian.net/wiki'
+    this.endpoint = `${this.baseUrl}/rest/api`
+    this.method = method
+    this.spaceKey = 'DRILL'
+  }
+
+  configure(config) {
+    switch (this.method) {
+      case ConfluenceAuthMethod.BASIC:
+        this.credentials = { user: config.user, token: config.token }
+        break
+      case ConfluenceAuthMethod.PAT:
+        this.credentials = { pat: config.pat }
+        break
+      case ConfluenceAuthMethod.OAUTH2:
+        this.credentials = { accessToken: config.accessToken, refreshToken: config.refreshToken, expiresAt: config.expiresAt }
+        break
+    }
+    if (config.spaceKey) this.spaceKey = config.spaceKey
+    this.tokenType = this.method
+    return { ok: true }
+  }
+
+  buildHeaders() {
+    const base = { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+    switch (this.method) {
+      case ConfluenceAuthMethod.BASIC:
+        return {
+          ...base,
+          'Authorization': `Basic ${btoa(`${this.credentials.user}:${this.credentials.token}`)}`
+        }
+      case ConfluenceAuthMethod.PAT:
+        return {
+          ...base,
+          'Authorization': `Bearer ${this.credentials.pat}`
+        }
+      case ConfluenceAuthMethod.OAUTH2:
+        return {
+          ...base,
+          'Authorization': `Bearer ${this.credentials.accessToken}`
+        }
+    }
+    return base
+  }
+
+  async refreshIfNeeded() {
+    if (this.method !== ConfluenceAuthMethod.OAUTH2) return { ok: true, refreshed: false }
+    if (!this.credentials?.expiresAt || Date.now() < this.credentials.expiresAt - 300_000) {
+      return { ok: true, refreshed: false }
+    }
+    return { ok: false, error: '需要实现具体 OAuth2 token refresh' }
+  }
+
+  async uploadPage(title, content, parentId = null) {
+    const payload = {
+      type: 'page',
+      title,
+      space: { key: this.spaceKey },
+      body: {
+        storage: { value: content, representation: 'wiki' }
+      }
+    }
+    if (parentId) payload.ancestors = [{ id: parentId }]
+    return this.request('/content', { method: 'POST', body: payload })
+  }
+}
+
+export class NotionAuthProvider extends ExportAuthProvider {
+  constructor(method = NotionAuthMethod.INTERNAL) {
+    super(authProviderType.NOTION)
+    this.endpoint = 'https://api.notion.com/v1'
+    this.method = method
+    this.apiVersion = '2022-06-28'
+    this.parentPageId = null
+    this.parentDatabaseId = null
+  }
+
+  configure(config) {
+    switch (this.method) {
+      case NotionAuthMethod.INTERNAL:
+        this.credentials = { token: config.internalToken }
+        break
+      case NotionAuthMethod.OAUTH:
+        this.credentials = { accessToken: config.accessToken, workspaceId: config.workspaceId, expiresAt: config.expiresAt }
+        break
+    }
+    this.parentPageId = config.parentPageId || null
+    this.parentDatabaseId = config.parentDatabaseId || null
+    this.tokenType = this.method
+    return { ok: true }
+  }
+
+  buildHeaders() {
+    const token = this.method === NotionAuthMethod.OAUTH ? this.credentials.accessToken : this.credentials.token
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
+      'Notion-Version': this.apiVersion
+    }
+  }
+
+  async refreshIfNeeded() {
+    if (this.method !== NotionAuthMethod.OAUTH) return { ok: true, refreshed: false }
+    if (!this.credentials?.expiresAt || Date.now() < this.credentials.expiresAt - 300_000) {
+      return { ok: true, refreshed: false }
+    }
+    return { ok: false, error: 'Notion OAuth 需要重新通过授权回调换取 token' }
+  }
+
+  async createPage(title, blocks, parentType = 'page') {
+    const payload = parentType === 'database'
+      ? { parent: { database_id: this.parentDatabaseId }, properties: { Name: { title: [{ text: { content: title } }] } }, children: blocks }
+      : { parent: { page_id: this.parentPageId }, properties: { title: [{ text: { content: title } }] }, children: blocks }
+    return this.request('/pages', { method: 'POST', body: payload })
+  }
+
+  markdownToBlocks(mdText) {
+    const lines = mdText.split('\n')
+    const blocks = []
+    for (const line of lines) {
+      if (line.startsWith('# ')) blocks.push({ object: 'block', type: 'heading_1', heading_1: { rich_text: [{ type: 'text', text: { content: line.slice(2) } }] } })
+      else if (line.startsWith('## ')) blocks.push({ object: 'block', type: 'heading_2', heading_2: { rich_text: [{ type: 'text', text: { content: line.slice(3) } }] } })
+      else if (line.startsWith('### ')) blocks.push({ object: 'block', type: 'heading_3', heading_3: { rich_text: [{ type: 'text', text: { content: line.slice(4) } }] } })
+      else if (line.startsWith('- ')) blocks.push({ object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ type: 'text', text: { content: line.slice(2) } }] } })
+      else if (/^\d+\. /.test(line)) blocks.push({ object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: [{ type: 'text', text: { content: line.replace(/^\d+\. /, '') } }] } })
+      else if (line.startsWith('> ')) blocks.push({ object: 'block', type: 'quote', quote: { rich_text: [{ type: 'text', text: { content: line.slice(2) } }] } })
+      else if (line.trim().length) blocks.push({ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: line } }] } })
+    }
+    return blocks.slice(0, 100)
   }
 }

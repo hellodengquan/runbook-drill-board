@@ -1,7 +1,11 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { generateTimelineEvents, formatDateTime, severityConfig, actionItemStatusConfig } from '../utils/helpers'
 
-export default function Timeline({ scenario }) {
+const LOW_END_THROTTLE_MS = 16
+const PASSIVE_OPT = { passive: true }
+const NON_PASSIVE_OPT = { passive: false }
+
+export default function Timeline({ scenario, runtimeConfig }) {
   const events = useMemo(() => generateTimelineEvents(scenario), [scenario])
   const containerRef = useRef(null)
   const [viewport, setViewport] = useState({ start: 0, end: Math.min(events.length, 50) })
@@ -10,10 +14,17 @@ export default function Timeline({ scenario }) {
   const [scrollLeft, setScrollLeft] = useState(0)
   const [zoom, setZoom] = useState(1)
   const [selectedEvent, setSelectedEvent] = useState(null)
+
   const touchState = useRef({
     startX: 0, startY: 0, initialDist: 0, initialZoom: 1,
-    startScroll: 0, startTime: 0
+    startScroll: 0, startTime: 0, startViewport: { start: 0, end: Math.min(events.length, 50) },
+    moved: false, rafPending: false, lastAppliedAt: 0
   })
+  const rafRef = useRef(0)
+
+  const enableTouchOpt = runtimeConfig?.timeline?.enableTouchOptimization !== false
+  const throttleMs = runtimeConfig?.timeline?.androidLowEndThrottleMs ?? LOW_END_THROTTLE_MS
+  const usePassive = runtimeConfig?.timeline?.passiveEvents !== false
 
   useEffect(() => {
     setViewport({ start: 0, end: Math.min(events.length, 50) })
@@ -45,12 +56,57 @@ export default function Timeline({ scenario }) {
     return events.slice(viewport.start, viewport.end + 10)
   }
 
-  const onTouchStart = (e) => {
+  const applyTouchUpdate = useCallback((dx, pinchScale) => {
+    if (!containerRef.current) return
+    const el = containerRef.current
+    const targetScroll = Math.max(0, touchState.current.startScroll - dx * zoom)
+    el.scrollLeft = targetScroll
+    setScrollLeft(targetScroll)
+
+    if (pinchScale && pinchScale !== touchState.current.initialZoom) {
+      const nextZoom = Math.min(4, Math.max(0.5, pinchScale))
+      setZoom(nextZoom)
+    }
+
+    const eventStep = Math.max(1, Math.round(120 / zoom))
+    const offsetEvents = Math.round(targetScroll / eventStep)
+    const visibleCount = Math.max(20, Math.ceil((el.clientWidth || 800) / eventStep))
+    setViewport({
+      start: Math.max(0, offsetEvents - 5),
+      end: Math.min(events.length, offsetEvents + visibleCount + 5)
+    })
+  }, [zoom, events.length])
+
+  const scheduleRafUpdate = useCallback((dx, pinchScale) => {
+    const now = Date.now()
+    if (!enableTouchOpt) {
+      applyTouchUpdate(dx, pinchScale)
+      return
+    }
+    if (now - touchState.current.lastAppliedAt < throttleMs) {
+      if (touchState.current.rafPending) return
+    }
+    touchState.current.rafPending = true
+    touchState.current.lastAppliedAt = now
+    if (typeof requestAnimationFrame === 'function') {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = requestAnimationFrame(() => {
+        applyTouchUpdate(dx, pinchScale)
+        touchState.current.rafPending = false
+      })
+    } else {
+      applyTouchUpdate(dx, pinchScale)
+      touchState.current.rafPending = false
+    }
+  }, [applyTouchUpdate, enableTouchOpt, throttleMs])
+
+  const onTouchStart = useCallback((e) => {
     if (e.touches.length === 1) {
       const t = e.touches[0]
       touchState.current = {
         startX: t.clientX, startY: t.clientY, initialDist: 0, initialZoom: zoom,
-        startScroll: scrollLeft, startTime: Date.now(), startViewport: { ...viewport }
+        startScroll: scrollLeft, startTime: Date.now(),
+        startViewport: { ...viewport }, moved: false, rafPending: false, lastAppliedAt: 0
       }
     } else if (e.touches.length === 2) {
       const dx = e.touches[0].clientX - e.touches[1].clientX
@@ -58,150 +114,183 @@ export default function Timeline({ scenario }) {
       touchState.current.initialDist = Math.sqrt(dx * dx + dy * dy)
       touchState.current.initialZoom = zoom
     }
-  }
+  }, [zoom, scrollLeft, viewport])
 
-  const onTouchMove = (e) => {
-    e.preventDefault()
-    if (e.touches.length === 1) {
+  const onTouchMove = useCallback((e) => {
+    const ts = touchState.current
+    if (!ts || ts.startTime === 0) return
+
+    if (e.touches.length === 1 && ts.initialDist === 0) {
       const t = e.touches[0]
-      const dx = t.clientX - touchState.current.startX
-      const dy = t.clientY - touchState.current.startY
-      if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 8) {
-        const newZoom = touchState.current.initialZoom
-        const container = containerRef.current
-        const maxScroll = container ? Math.max(0, container.scrollWidth - container.clientWidth) : 0
-        const newScroll = Math.min(maxScroll, Math.max(0, touchState.current.startScroll - dx * newZoom))
-        setScrollLeft(newScroll)
-        if (container) container.scrollLeft = newScroll
+      const dx = t.clientX - ts.startX
+      const dy = t.clientY - ts.startY
+      if (Math.abs(dx) > 8 || Math.abs(dy) > 8) ts.moved = true
+      if (Math.abs(dx) >= Math.abs(dy) && usePassive === false) {
+        try { e.preventDefault() } catch (_) { /* noop */ }
       }
+      scheduleRafUpdate(dx, null)
     } else if (e.touches.length === 2) {
       const dx = e.touches[0].clientX - e.touches[1].clientX
       const dy = e.touches[0].clientY - e.touches[1].clientY
       const dist = Math.sqrt(dx * dx + dy * dy)
-      if (touchState.current.initialDist > 0) {
-        const ratio = dist / touchState.current.initialDist
-        const newZoom = Math.max(0.5, Math.min(2.5, touchState.current.initialZoom * ratio))
-        setZoom(newZoom)
+      if (ts.initialDist > 0) {
+        const scale = ts.initialZoom * (dist / ts.initialDist)
+        scheduleRafUpdate(0, scale)
       }
+      ts.moved = true
     }
-  }
+  }, [scheduleRafUpdate, usePassive])
 
-  const onTouchEnd = (e) => {
-    const touchElapsed = Date.now() - touchState.current.startTime
-    const t = e.changedTouches?.[0]
-    if (touchElapsed < 300 && t) {
-      handleTap(t.clientX, t.clientY)
+  const onTouchEnd = useCallback(() => {
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = 0
     }
-    touchState.current = { startX: 0, startY: 0, initialDist: 0, initialZoom: 1, startScroll: 0, startTime: 0 }
-  }
+    touchState.current.rafPending = false
+  }, [])
 
-  const handleTap = (clientX, clientY) => {
-    const el = document.elementFromPoint(clientX, clientY)
-    const itemEl = el?.closest('.timeline-item')
-    if (itemEl && itemEl.dataset.eventId) {
-      const event = events.find(ev => ev.id === itemEl.dataset.eventId)
-      setSelectedEvent(prev => prev?.id === event?.id ? null : event)
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || !enableTouchOpt) return
+    const opt = usePassive ? PASSIVE_OPT : NON_PASSIVE_OPT
+    el.addEventListener('touchstart', onTouchStart, opt)
+    el.addEventListener('touchmove', onTouchMove, opt)
+    el.addEventListener('touchend', onTouchEnd, PASSIVE_OPT)
+    el.addEventListener('touchcancel', onTouchEnd, PASSIVE_OPT)
+    return () => {
+      el.removeEventListener('touchstart', onTouchStart, opt)
+      el.removeEventListener('touchmove', onTouchMove, opt)
+      el.removeEventListener('touchend', onTouchEnd, PASSIVE_OPT)
+      el.removeEventListener('touchcancel', onTouchEnd, PASSIVE_OPT)
     }
+  }, [onTouchStart, onTouchMove, onTouchEnd, enableTouchOpt, usePassive])
+
+  const onEventTap = (ev, event) => {
+    const moved = touchState.current.moved
+    if (moved) return
+    if (Date.now() - (touchState.current.startTime || 0) > 300) return
+    setSelectedEvent(selectedEvent?.id === event.id ? null : event)
   }
 
   const onMouseDown = (e) => {
-    if (e.button !== 0) return
     setIsDragging(true)
     setDragStartX(e.clientX)
   }
-
   const onMouseMove = (e) => {
-    if (!isDragging) return
+    if (!isDragging || !containerRef.current) return
     const dx = e.clientX - dragStartX
-    const container = containerRef.current
-    if (container) container.scrollLeft -= dx
-    setDragStartX(e.clientX)
+    containerRef.current.scrollLeft = scrollLeft - dx
   }
-
   const onMouseUp = () => setIsDragging(false)
 
-  const handleWheel = (e) => {
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault()
-      setZoom(prev => Math.max(0.5, Math.min(2.5, prev - e.deltaY * 0.001)))
-    }
-  }
+  const totalDuration = events.length > 1
+    ? Math.round((new Date(events[events.length - 1].time) - new Date(events[0].time)) / 60000)
+    : 0
 
   const visibleEvents = getVisibleEvents()
-
-  if (events.length === 0) {
-    return (
-      <div className="timeline-empty">
-        <p>暂无时间轴事件</p>
-      </div>
-    )
-  }
+  const offsetX = Math.max(0, viewport.start) * 120 * zoom
 
   return (
     <div className="timeline-wrapper">
-      <div className="timeline-toolbar">
-        <button className="tl-btn" onClick={() => setZoom(z => Math.min(2.5, z + 0.1))} title="放大">🔍+</button>
-        <button className="tl-btn" onClick={() => setZoom(z => Math.max(0.5, z - 0.1))} title="缩小">🔍-</button>
-        <button className="tl-btn" onClick={() => setZoom(1)} title="重置">↺</button>
-        <span className="tl-stats">共 {events.length} 个事件{zoom !== 1 ? ` | ${Math.round(zoom * 100)}%` : ''}</span>
+      <div className="timeline-header">
+        <div className="timeline-title">
+          <span>📅 时间轴视图</span>
+          <span className="timeline-zoom-indicator">缩放: {zoom.toFixed(1)}×</span>
+          <span className="timeline-meta">{events.length} 事件 / {totalDuration} 分钟</span>
+          <span className={`timeline-status ${enableTouchOpt ? 'ok' : 'default'}`}>
+            {enableTouchOpt ? '移动端优化已启用' : '移动端优化已禁用'}
+          </span>
+        </div>
+        <div className="timeline-controls">
+          <button className="tl-btn" onClick={() => setZoom(z => Math.max(0.5, +(z - 0.2).toFixed(2)))}>－</button>
+          <button className="tl-btn" onClick={() => setZoom(z => Math.min(4, +(z + 0.2).toFixed(2)))}>＋</button>
+          <button className="tl-btn" onClick={() => setViewport({ start: 0, end: Math.min(events.length, 50) })}>回到开始</button>
+        </div>
+      </div>
+
+      <div className="timeline-mobile-hint">
+        💡 移动端：横向滑动滚动，双指捏合缩放
       </div>
 
       <div
         ref={containerRef}
-        className={`timeline-container ${isDragging ? 'is-dragging' : ''}`}
-        onTouchStart={onTouchStart}
-        onTouchMove={onTouchMove}
-        onTouchEnd={onTouchEnd}
+        className={`timeline-container ${isDragging ? 'dragging' : ''}`}
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onMouseUp={onMouseUp}
         onMouseLeave={onMouseUp}
-        onWheel={handleWheel}
-        style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}
+        onScroll={(e) => {
+          const sl = e.target.scrollLeft
+          setScrollLeft(sl)
+          const eventStep = Math.max(1, Math.round(120 / zoom))
+          const offsetEvents = Math.round(sl / eventStep)
+          const visibleCount = Math.max(20, Math.ceil((e.target.clientWidth || 800) / eventStep))
+          setViewport({
+            start: Math.max(0, offsetEvents - 5),
+            end: Math.min(events.length, offsetEvents + visibleCount + 5)
+          })
+        }}
+        style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
       >
-        <div className="timeline">
-          <div className="timeline-line"></div>
-          {visibleEvents.map((event, idx) => (
-            <div
-              key={event.id}
-              data-event-id={event.id}
-              className={`timeline-item ${idx % 2 === 0 ? 'left' : 'right'} ${selectedEvent?.id === event.id ? 'is-selected' : ''}`}
-              style={{ backgroundColor: getEventColor(event) }}
-              onClick={() => setSelectedEvent(prev => prev?.id === event.id ? null : event)}
-            >
-              <div className="timeline-dot">{getEventIcon(event)}</div>
-              <div className="timeline-content">
-                <div className="timeline-time">{formatDateTime(event.time)}</div>
-                <div className="timeline-title">{event.title}</div>
-                {event.description && (
-                  <div className="timeline-desc">{event.description}</div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+        <svg
+          className="timeline-svg"
+          width={Math.max(800, events.length * 120 * zoom + 100)}
+          height={280}
+        >
+          <defs>
+            <linearGradient id="tlGrad" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stopColor="#6366f1" stopOpacity="0.25" />
+              <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.25" />
+            </linearGradient>
+          </defs>
+          <rect x="0" y="140" width="100%" height="4" fill="url(#tlGrad)" rx="2" />
+          {visibleEvents.map((event, relIdx) => {
+            const idx = viewport.start + relIdx
+            const x = offsetX + relIdx * 120 * zoom + 60
+            const yTop = 60 + ((idx % 3) * 20)
+            const yBottom = 200 - ((idx % 2) * 20)
+            const isTop = idx % 2 === 0
+            const cy = isTop ? yTop + 30 : yBottom
+            const lineY1 = isTop ? yTop + 60 : 140
+            return (
+              <g key={event.id} transform={`translate(${x}, 0)`} style={{ cursor: 'pointer' }}
+                 onClick={(e) => onEventTap(e, event)}>
+                <line x1="0" y1={lineY1} x2="0" y2="140" stroke="#cbd5e1" strokeWidth="2" />
+                <circle cx="0" cy="140" r="9" fill="#fff" stroke="#6366f1" strokeWidth="3" />
+                <circle cx="0" cy="140" r="4" fill="#6366f1" />
+                <g transform={`translate(-60, ${isTop ? 0 : 160})`}>
+                  <rect x="0" y={isTop ? 0 : 0} width="120" height="58" rx="8"
+                        fill={getEventColor(event)} stroke={selectedEvent?.id === event.id ? '#6366f1' : '#d1d5db'}
+                        strokeWidth={selectedEvent?.id === event.id ? 2 : 1} />
+                  <text x="60" y="20" textAnchor="middle" fontSize="18">{getEventIcon(event)}</text>
+                  <text x="60" y="40" textAnchor="middle" fontSize="10" fill="#475569"
+                        style={{ pointerEvents: 'none' }}>
+                    {(event.title || event.type).slice(0, 14)}
+                  </text>
+                  <text x="60" y="52" textAnchor="middle" fontSize="9" fill="#94a3b8">
+                    {formatDateTime(event.time).slice(5, 16)}
+                  </text>
+                </g>
+                <circle cx="0" cy={cy - 100} r="0" />
+              </g>
+            )
+          })}
+        </svg>
       </div>
 
       {selectedEvent && (
-        <div className="timeline-detail-modal" onClick={() => setSelectedEvent(null)}>
-          <div className="timeline-detail-content" onClick={e => e.stopPropagation()}>
+        <div className="timeline-detail-card" onClick={() => setSelectedEvent(null)}>
+          <div className="timeline-detail-inner" onClick={e => e.stopPropagation()}>
             <div className="timeline-detail-header">
-              <span className="timeline-detail-icon">{getEventIcon(selectedEvent)}</span>
-              <h3>{selectedEvent.title}</h3>
-              <button className="tl-close" onClick={() => setSelectedEvent(null)}>×</button>
+              <strong>{getEventIcon(selectedEvent)} {(selectedEvent.title || selectedEvent.type)}</strong>
+              <button className="close-x" onClick={() => setSelectedEvent(null)}>×</button>
             </div>
-            <div className="timeline-detail-meta">
-              <div>📅 {formatDateTime(selectedEvent.time)}</div>
-              <div>🏷️ 类型: {selectedEvent.type}</div>
-              {selectedEvent.severity && (
-                <div style={{ color: severityConfig[selectedEvent.severity]?.text }}>
-                  ⚠️ 严重度: {severityConfig[selectedEvent.severity]?.label}
-                </div>
-              )}
+            <div className="timeline-detail-body">
+              <div><span className="muted">时间：</span>{formatDateTime(selectedEvent.time)}</div>
+              <div><span className="muted">类型：</span>{selectedEvent.type}</div>
+              {selectedEvent.severity && <div><span className="muted">严重度：</span>{severityConfig[selectedEvent.severity]?.label || selectedEvent.severity}</div>}
+              {selectedEvent.description && <div className="mt8"><span className="muted">描述：</span>{selectedEvent.description}</div>}
             </div>
-            {selectedEvent.description && (
-              <div className="timeline-detail-desc">{selectedEvent.description}</div>
-            )}
           </div>
         </div>
       )}

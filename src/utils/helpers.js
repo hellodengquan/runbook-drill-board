@@ -91,6 +91,142 @@ export const calculateDowntimeFromSlo = (slo) => {
 }
 
 /* ============================================
+   SLI (Service Level Indicator) 扩展：错误率 + 吞吐量
+   ============================================ */
+
+export const sliTypes = {
+  ERROR_RATE: 'error_rate',
+  THROUGHPUT: 'throughput',
+  LATENCY_P99: 'latency_p99',
+  AVAILABILITY: 'availability'
+}
+
+export const throughputUnits = [
+  { id: 'rps', label: 'RPS', multiplier: 1 },
+  { id: 'rpm', label: 'RPM', multiplier: 1 / 60 },
+  { id: 'qps', label: 'QPS', multiplier: 1 },
+  { id: 'tps', label: 'TPS', multiplier: 1 }
+]
+
+export const createSli = (type = sliTypes.AVAILABILITY, config = {}) => {
+  const base = {
+    id: `sli-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    type,
+    enabled: true,
+    createdAt: new Date().toISOString()
+  }
+  switch (type) {
+    case sliTypes.ERROR_RATE: {
+      const threshold = config.threshold ?? 0.1
+      return {
+        ...base,
+        threshold: Number(threshold.toFixed(6)),
+        thresholdType: 'percent',
+        actualValue: config.actualValue ?? null,
+        raw: `错误率 ≤ ${Number(threshold.toFixed(2))}%`
+      }
+    }
+    case sliTypes.THROUGHPUT: {
+      const minVal = config.minValue ?? 1000
+      const unit = config.unit ?? 'rps'
+      return {
+        ...base,
+        minValue: minVal,
+        unit,
+        actualValue: config.actualValue ?? null,
+        raw: `吞吐量 ≥ ${minVal} ${throughputUnits.find(u => u.id === unit)?.label || 'RPS'}`
+      }
+    }
+    case sliTypes.LATENCY_P99: {
+      const thresholdMs = config.thresholdMs ?? 500
+      return {
+        ...base,
+        thresholdMs,
+        actualValueMs: config.actualValueMs ?? null,
+        raw: `P99 延迟 ≤ ${thresholdMs}ms`
+      }
+    }
+    case sliTypes.AVAILABILITY:
+    default: {
+      const threshold = config.threshold ?? 99.9
+      return {
+        ...base,
+        threshold: Number(threshold.toFixed(6)),
+        thresholdType: 'percent',
+        actualValue: config.actualValue ?? null,
+        raw: `可用性 ≥ ${Number(threshold.toFixed(2))}%`
+      }
+    }
+  }
+}
+
+export const createSloWithSlis = ({
+  percent = 99.9,
+  windowValue = 30,
+  windowUnit = 'day',
+  slis = null
+} = {}) => {
+  const base = createSloComposite(percent, windowValue, windowUnit)
+  const errorRate = 100 - percent
+  const defaultSlis = [
+    createSli(sliTypes.AVAILABILITY, { threshold: percent }),
+    createSli(sliTypes.ERROR_RATE, { threshold: Number(errorRate.toFixed(6)) }),
+    createSli(sliTypes.THROUGHPUT, { minValue: 1000, unit: 'rps' })
+  ]
+  return {
+    ...base,
+    slis: slis || defaultSlis,
+    sloVersion: '2.0-sli'
+  }
+}
+
+export const validateSli = (sli) => {
+  if (!sli || !sli.type) return { valid: false, reason: 'SLI 类型缺失' }
+  switch (sli.type) {
+    case sliTypes.ERROR_RATE:
+      if (sli.threshold < 0 || sli.threshold > 100) return { valid: false, reason: '错误率阈值需 0~100%' }
+      break
+    case sliTypes.THROUGHPUT:
+      if (sli.minValue < 0) return { valid: false, reason: '吞吐量不能为负' }
+      break
+  }
+  return { valid: true }
+}
+
+export const isSliMet = (sli) => {
+  if (!sli || sli.actualValue == null && sli.actualValueMs == null) return null
+  switch (sli.type) {
+    case sliTypes.ERROR_RATE:
+      return sli.actualValue <= sli.threshold
+    case sliTypes.THROUGHPUT:
+      return sli.actualValue >= sli.minValue
+    case sliTypes.LATENCY_P99:
+      return sli.actualValueMs <= sli.thresholdMs
+    case sliTypes.AVAILABILITY:
+      return sli.actualValue >= sli.threshold
+    default:
+      return null
+  }
+}
+
+export const formatSli = (sli) => {
+  if (!sli) return ''
+  switch (sli.type) {
+    case sliTypes.ERROR_RATE:
+      return `错误率 ${sli.actualValue != null ? `${Number(sli.actualValue.toFixed(2))}% / ` : ''}≤ ${Number(sli.threshold.toFixed(2))}%`
+    case sliTypes.THROUGHPUT: {
+      const unit = throughputUnits.find(u => u.id === sli.unit)?.label || 'RPS'
+      return `吞吐量 ${sli.actualValue != null ? `${sli.actualValue}${unit} / ` : ''}≥ ${sli.minValue}${unit}`
+    }
+    case sliTypes.LATENCY_P99:
+      return `P99 ${sli.actualValueMs != null ? `${sli.actualValueMs}ms / ` : ''}≤ ${sli.thresholdMs}ms`
+    case sliTypes.AVAILABILITY:
+    default:
+      return `可用性 ${sli.actualValue != null ? `${Number(sli.actualValue.toFixed(2))}% / ` : ''}≥ ${Number(sli.threshold.toFixed(2))}%`
+  }
+}
+
+/* ============================================
    Severity 升级 / 降级 阈值路径
    ============================================ */
 
@@ -1027,4 +1163,380 @@ export const downloadFile = (content, filename, mimeType = 'text/markdown') => {
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+/* ============================================
+   Severity ML 自动学习：历史样本采集 + 分位数学习
+   ============================================ */
+
+export const MlSeverityLearner = {
+  samples: [],
+  MAX_SAMPLES: 5000,
+  LEARNING_INTERVAL: 100,
+
+  addSample(issue, actualDurationMin, finalResolution) {
+    if (this.samples.length >= this.MAX_SAMPLES) {
+      this.samples.splice(0, 200)
+    }
+    this.samples.push({
+      id: `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+      severity: issue.severity,
+      rootCause: issue.rootCause || 'unknown',
+      durationMin: actualDurationMin,
+      impactUsers: issue.impactUsers || 0,
+      reopenCount: issue.reopenCount || 0,
+      finalResolution,
+      takenAt: Date.now()
+    })
+    if (this.samples.length > 0 && this.samples.length % this.LEARNING_INTERVAL === 0) {
+      return this.calculateSuggestedThresholds()
+    }
+    return null
+  },
+
+  _percentile(arr, p) {
+    if (!arr.length) return 0
+    const sorted = [...arr].sort((a, b) => a - b)
+    const idx = Math.min(Math.floor((p / 100) * sorted.length), sorted.length - 1)
+    return sorted[idx]
+  },
+
+  _groupBySeverity() {
+    const groups = {}
+    this.samples.forEach(s => {
+      if (!groups[s.severity]) groups[s.severity] = []
+      groups[s.severity].push(s)
+    })
+    return groups
+  },
+
+  calculateSuggestedThresholds() {
+    const groups = this._groupBySeverity()
+    const suggestion = { generatedAt: Date.now(), sampleCount: this.samples.length, thresholds: {} }
+    Object.keys(groups).forEach(sev => {
+      const list = groups[sev]
+      const durations = list.map(s => s.durationMin)
+      const impacts = list.map(s => s.impactUsers)
+      suggestion.thresholds[sev] = {
+        durationP50: this._percentile(durations, 50),
+        durationP95: this._percentile(durations, 95),
+        durationP99: this._percentile(durations, 99),
+        impactP95: this._percentile(impacts, 95),
+        autoEscalationMinutes: Math.max(5, Math.round(this._percentile(durations, 60))),
+        impactThreshold: Math.max(10, Math.round(this._percentile(impacts, 80)))
+      }
+    })
+    return suggestion
+  },
+
+  applyLearnedThresholds(baseConfig, suggestion) {
+    if (!suggestion || !suggestion.thresholds) return baseConfig
+    const merged = JSON.parse(JSON.stringify(baseConfig))
+    Object.keys(suggestion.thresholds).forEach(sev => {
+      if (!merged[sev]) return
+      const learned = suggestion.thresholds[sev]
+      const esc = merged[sev].escalation
+      if (esc && esc.conditions) {
+        esc.conditions.forEach(c => {
+          if (c.type === 'time') c.threshold = learned.autoEscalationMinutes
+          if (c.type === 'impact') c.threshold = learned.impactThreshold
+        })
+      }
+    })
+    merged._learned = { at: suggestion.generatedAt, samples: suggestion.sampleCount }
+    return merged
+  }
+}
+
+/* ============================================
+   企业日历同步 Provider 抽象
+   ============================================ */
+
+export const calendarProviders = {
+  GOOGLE: { id: 'google', name: 'Google Workspace', auth: 'oauth2', endpoint: 'https://www.googleapis.com/calendar/v3' },
+  OFFICE365: { id: 'office365', name: 'Microsoft 365', auth: 'oauth2', endpoint: 'https://graph.microsoft.com/v1.0' },
+  WECOM: { id: 'wecom', name: '企业微信', auth: 'access_token', endpoint: 'https://qyapi.weixin.qq.com/cgi-bin' },
+  DINGTALK: { id: 'dingtalk', name: '钉钉', auth: 'access_token', endpoint: 'https://oapi.dingtalk.com' },
+  MOCK: { id: 'mock', name: 'Mock (本地演示)', auth: 'none', endpoint: '' }
+}
+
+export class CalendarSyncService {
+  constructor(provider = calendarProviders.MOCK, credentials = {}) {
+    this.provider = provider
+    this.credentials = credentials
+    this.lastSyncAt = null
+    this.cache = { holidays: [], onCallShifts: [] }
+  }
+
+  async authenticate(codeOrToken) {
+    switch (this.provider.auth) {
+      case 'oauth2':
+        this.credentials.accessToken = codeOrToken
+        this.credentials.expiresAt = Date.now() + 3600_000
+        break
+      case 'access_token':
+        this.credentials.accessToken = codeOrToken
+        break
+      case 'none':
+      default:
+        this.credentials.accessToken = 'mock-token'
+    }
+    return { ok: true, provider: this.provider.id }
+  }
+
+  isTokenValid() {
+    if (!this.credentials.accessToken) return false
+    if (this.provider.auth === 'none') return true
+    if (!this.credentials.expiresAt) return true
+    return Date.now() < this.credentials.expiresAt - 300_000
+  }
+
+  async fetchHolidays(year = new Date().getFullYear()) {
+    if (!this.isTokenValid()) return { ok: false, error: '未授权或Token过期', holidays: [] }
+    const cached = this.cache.holidays.find(h => h.year === year)
+    if (cached && (Date.now() - cached.fetchedAt) < 3600_000) return { ok: true, holidays: cached.days }
+    const mockHolidays = this._generateMockHolidays(year)
+    this.cache.holidays.push({ year, fetchedAt: Date.now(), days: mockHolidays })
+    this.lastSyncAt = Date.now()
+    return { ok: true, holidays: mockHolidays, source: this.provider.id }
+  }
+
+  async fetchOnCallCalendar(calendarId, from, to) {
+    if (!this.isTokenValid()) return { ok: false, error: '未授权', shifts: [] }
+    const mockShifts = this._generateMockOnCalls(from, to)
+    this.cache.onCallShifts.push({ calendarId, from, to, shifts: mockShifts, fetchedAt: Date.now() })
+    this.lastSyncAt = Date.now()
+    return { ok: true, shifts: mockShifts, source: this.provider.id }
+  }
+
+  matchHolidayPriority(dateStr, holidays, priorityLevels) {
+    const d = new Date(dateStr)
+    const hit = holidays.find(h => h.date === formatDate(dateStr))
+    if (hit) {
+      const weight = hit.type === 'statutory' ? 5 : hit.type === 'public' ? 4 : hit.type === 'company' ? 3 : 2
+      const matched = priorityLevels.find(l => l.weight === weight) || priorityLevels[priorityLevels.length - 1]
+      return { isHoliday: true, meta: hit, priority: matched, weight }
+    }
+    const wd = d.getDay()
+    if (wd === 0 || wd === 6) {
+      const matched = priorityLevels.find(l => l.weight === 2) || priorityLevels[priorityLevels.length - 1]
+      return { isHoliday: true, meta: { type: 'weekend', name: wd === 0 ? '周日' : '周六' }, priority: matched, weight: 2 }
+    }
+    return { isHoliday: false, priority: priorityLevels[0] || { id: 'workday', name: '工作日', weight: 1 }, weight: 1 }
+  }
+
+  _generateMockHolidays(year) {
+    return [
+      { date: `${year}-01-01`, name: '元旦', type: 'statutory' },
+      { date: `${year}-02-10`, name: '春节', type: 'statutory' },
+      { date: `${year}-02-11`, name: '春节', type: 'statutory' },
+      { date: `${year}-02-12`, name: '春节', type: 'statutory' },
+      { date: `${year}-04-06`, name: '清明节', type: 'statutory' },
+      { date: `${year}-05-01`, name: '劳动节', type: 'statutory' },
+      { date: `${year}-06-22`, name: '端午节', type: 'statutory' },
+      { date: `${year}-10-01`, name: '国庆', type: 'statutory' },
+      { date: `${year}-02-14`, name: '情人节', type: 'company' },
+      { date: `${year}-12-25`, name: '圣诞节', type: 'public' }
+    ]
+  }
+
+  _generateMockOnCalls(from, to) {
+    const result = []
+    const start = new Date(from)
+    const end = new Date(to)
+    let cur = new Date(start)
+    const persons = ['张三', '李四', '王五', '赵六', '孙七']
+    let idx = 0
+    while (cur <= end) {
+      result.push({
+        id: `shift-${cur.getTime()}`,
+        date: formatDate(cur.toISOString()),
+        primary: persons[idx % persons.length],
+        secondary: persons[(idx + 1) % persons.length],
+        startTime: '09:00',
+        endTime: '次日09:00'
+      })
+      idx++
+      cur.setDate(cur.getDate() + 1)
+    }
+    return result
+  }
+}
+
+/* ============================================
+   Runtime 管理员配置系统 + 权限校验
+   ============================================ */
+
+export const Role = {
+  ADMIN: 'admin',
+  MANAGER: 'manager',
+  REVIEWER: 'reviewer',
+  MEMBER: 'member',
+  GUEST: 'guest'
+}
+
+export const defaultRuntimeConfig = {
+  actionItem: {
+    maxReopen: 5,
+    reopenCooldownHours: 24,
+    allowForceReopenRole: [Role.ADMIN, Role.MANAGER]
+  },
+  severity: {
+    enableAutoEscalation: true,
+    enableMlLearning: true,
+    minEscalationMinutes: 5
+  },
+  storage: {
+    localStorageQuotaMB: 4,
+    useIndexedDBFallback: true,
+    evictOnStartup: false
+  },
+  sync: {
+    maxRetries: 5,
+    clockDriftToleranceMs: 5000,
+    offlineTimeoutMs: 10000,
+    snapshotMergeEnabled: true
+  },
+  timeline: {
+    enableTouchOptimization: true,
+    androidLowEndThrottleMs: 16,
+    passiveEvents: true
+  },
+  depGraph: {
+    columnVirtualization: true,
+    clusterThreshold: 8,
+    maxNodesFullView: 300
+  },
+  export: {
+    confluenceSpaceKey: 'DRILL',
+    notionParentPageId: '',
+    defaultFormat: 'standard'
+  },
+  _meta: {
+    updatedAt: Date.now(),
+    updatedBy: 'system',
+    version: 1
+  }
+}
+
+export const permissions = {
+  CONFIG_EDIT: [Role.ADMIN],
+  REOPEN_FORCE: [Role.ADMIN, Role.MANAGER],
+  EXPORT_ADVANCED: [Role.ADMIN, Role.MANAGER, Role.REVIEWER],
+  SEVERITY_CHANGE: [Role.ADMIN, Role.MANAGER, Role.REVIEWER],
+  STORAGE_MANAGE: [Role.ADMIN],
+  SYNC_MANUAL: [Role.ADMIN, Role.MANAGER]
+}
+
+export class RuntimeConfigService {
+  constructor(storage, initial = defaultRuntimeConfig) {
+    this.storage = storage
+    this.config = JSON.parse(JSON.stringify(initial))
+    this.listeners = new Set()
+    this.currentUser = { id: 'u-default', name: '当前用户', role: Role.MEMBER }
+  }
+
+  async load() {
+    try {
+      const saved = await this.storage?.getConfig?.()
+      if (saved && saved._meta) {
+        this.config = { ...this.config, ...saved }
+        return { ok: true, fromStorage: true }
+      }
+    } catch (_) { /* ignore */ }
+    return { ok: true, fromStorage: false, usedDefaults: true }
+  }
+
+  async save(partialUpdate, actor = this.currentUser) {
+    const permOk = this.can(actor.role, 'CONFIG_EDIT')
+    if (!permOk) return { ok: false, error: `权限不足，需要: ${permissions.CONFIG_EDIT.join('/')}` }
+    const merged = this._deepMerge(this.config, partialUpdate)
+    merged._meta = { ...this.config._meta, updatedAt: Date.now(), updatedBy: actor.id, version: (this.config._meta?.version || 0) + 1 }
+    const errors = this._validate(merged)
+    if (errors.length) return { ok: false, errors }
+    this.config = merged
+    this._notify()
+    try { await this.storage?.setConfig?.(this.config) } catch (_) { /* ignore */ }
+    return { ok: true, version: this.config._meta.version }
+  }
+
+  get(path, defaultValue = undefined) {
+    const keys = path.split('.')
+    let cur = this.config
+    for (const k of keys) {
+      if (cur == null || typeof cur !== 'object') return defaultValue
+      cur = cur[k]
+    }
+    return cur == null ? defaultValue : cur
+  }
+
+  setCurrentUser(user) { this.currentUser = user; return this }
+
+  can(role, permission) {
+    if (role === Role.ADMIN) return true
+    const allowed = permissions[permission] || []
+    return allowed.includes(role)
+  }
+
+  canForceReopen(actionItem) {
+    const allowedRoles = this.get('actionItem.allowForceReopenRole', [Role.ADMIN])
+    return allowedRoles.includes(this.currentUser.role)
+  }
+
+  subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn) }
+
+  _notify() { this.listeners.forEach(fn => { try { fn(this.config) } catch (_) {} }) }
+
+  _deepMerge(target, source) {
+    const out = { ...target }
+    Object.keys(source).forEach(k => {
+      if (source[k] && typeof source[k] === 'object' && !Array.isArray(source[k])) {
+        out[k] = this._deepMerge(out[k] || {}, source[k])
+      } else {
+        out[k] = source[k]
+      }
+    })
+    return out
+  }
+
+  _validate(cfg) {
+    const errs = []
+    if (cfg.actionItem?.maxReopen < 0) errs.push('maxReopen 不能为负')
+    if (cfg.sync?.clockDriftToleranceMs < 0) errs.push('clockDriftToleranceMs 不能为负')
+    if (cfg.storage?.localStorageQuotaMB < 1 || cfg.storage?.localStorageQuotaMB > 10) errs.push('localStorageQuotaMB 范围 1~10')
+    return errs
+  }
+}
+
+/* ============================================
+   时钟漂移容忍工具
+   ============================================ */
+
+export const clockDriftUtils = {
+  DEFAULT_TOLERANCE_MS: 5000,
+  driftEstimate: 0,
+  lastNtpCheckAt: 0,
+
+  setDriftEstimate(ms) {
+    this.driftEstimate = ms
+    this.lastNtpCheckAt = Date.now()
+  },
+
+  nowCorrected() {
+    return Date.now() + this.driftEstimate
+  },
+
+  withinTolerance(localTs, remoteTs, tolerance = this.DEFAULT_TOLERANCE_MS) {
+    return Math.abs((localTs || 0) - (remoteTs || 0)) <= tolerance
+  },
+
+  shouldAutoMerge(localVersion, remoteVersion, updatedAtLocal, updatedAtRemote, tolerance = this.DEFAULT_TOLERANCE_MS) {
+    if (localVersion === remoteVersion) return 'same'
+    if (this.withinTolerance(updatedAtLocal, updatedAtRemote, tolerance)) return 'drift-tolerant'
+    if (localVersion > remoteVersion) return 'local-newer'
+    if (Math.abs(localVersion - remoteVersion) <= 1 && this.withinTolerance(updatedAtLocal, updatedAtRemote, tolerance * 2)) {
+      return 'minor-drift'
+    }
+    return 'conflict'
+  }
 }

@@ -603,3 +603,401 @@
     color: #e5e7eb;
   }
 }
+
+/* ============================================
+   SLI 指标卡片
+   ============================================ */
+.sli-card {
+  padding: 12px 16px;
+  background: #f0fdf4;
+  border: 2px solid #bbf7d0;
+  border-radius: 10px;
+  min-width: 200px;
+  flex: 1.2;
+}
+
+.sli-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #15803d;
+  margin-bottom: 8px;
+  letter-spacing: 0.3px;
+}
+
+.sli-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 0;
+  font-size: 12px;
+  color: #166534;
+  gap: 8px;
+}
+
+.sli-row .sli-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sli-row.ok {
+  color: #15803d;
+}
+
+.sli-row.bad {
+  color: #b91c1c;
+  background: rgba(239,68,68,0.04);
+  border-radius: 4px;
+  padding: 3px 4px;
+}
+
+.sli-state {
+  font-size: 11px;
+}
+
+/* ============================================
+   管理员工具栏
+   ============================================ */
+.admin-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid #e5e7eb;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  font-size: 12px;
+}
+
+.user-avatar {
+  font-size: 14px;
+}
+
+.user-name {
+  font-weight: 500;
+  color: #1e293b;
+}
+
+.user-role {
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.role-admin {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+.role-manager {
+  background: #fef3c7;
+  color: #92400e;
+}
+.role-reviewer {
+  background: #dbeafe;
+  color: #1e40af;
+}
+.role-member {
+  background: #dcfce7;
+  color: #166534;
+}
+.role-guest {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.admin-btn {
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.15s;
+}
+
+.admin-btn:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+.admin-btn.active {
+  background: #ede9fe;
+  border-color: #8b5cf6;
+  color: #5b21b6;
+}
+
+.admin-btn.admin {
+  background: #fef2f2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+
+/* ============================================
+   管理员配置 Modal
+   ============================================ */
+.admin-config {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 8px 4px;
+}
+
+.admin-section {
+  padding: 16px 18px;
+  background: #fafafa;
+  border: 1px solid #f1f5f9;
+  border-radius: 10px;
+}
+
+.admin-section h4 {
+  margin: 0 0 14px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #0f172a;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed #e2e8f0;
+}
+
+.config-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  min-height: 32px;
+  flex-wrap: wrap;
+}
+
+.config-row label {
+  flex: 0 0 220px;
+  font-size: 12.5px;
+  color: #475569;
+  font-weight: 500;
+}
+
+.config-row input[type="number"],
+.config-row input[type="text"],
+.config-row select {
+  padding: 5px 9px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 13px;
+  outline: none;
+  background: #fff;
+}
+
+.config-row input[type="number"]:focus,
+.config-row input[type="text"]:focus,
+.config-row select:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+}
+
+.config-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+
+.config-row .muted {
+  color: #94a3b8;
+  font-size: 11.5px;
+}
+
+.perm-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.perm-title {
+  font-weight: 600;
+  color: #334155;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.perm-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  font-size: 12px;
+  color: #475569;
+}
+
+.perm-ok {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.perm-no {
+  color: #94a3b8;
+}
+
+.config-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: #94a3b8;
+  padding: 6px 10px;
+  background: #fff;
+  border: 1px dashed #e2e8f0;
+  border-radius: 6px;
+}
+
+/* ============================================
+   日历同步 Modal
+   ============================================ */
+.calendar-sync {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.calendar-actions {
+  display: flex;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.calendar-actions .btn {
+  padding: 8px 16px;
+  border-radius: 7px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.calendar-actions .btn.primary {
+  background: #6366f1;
+  border-color: #6366f1;
+  color: #fff;
+}
+
+.calendar-actions .btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.holiday-list ul,
+.shift-list ul {
+  list-style: none;
+  padding: 0;
+  margin: 10px 0 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.holiday-list h4,
+.shift-list h4,
+.ml-info h4 {
+  margin: 14px 0 8px;
+  font-size: 13px;
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.holiday-item,
+.shift-item {
+  display: flex;
+  gap: 12px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.holiday-item.type-statutory {
+  background: rgba(220,38,38,0.05);
+  border-left: 3px solid #dc2626;
+}
+.holiday-item.type-public {
+  background: rgba(245,158,11,0.05);
+  border-left: 3px solid #f59e0b;
+}
+.holiday-item.type-company {
+  background: rgba(99,102,241,0.05);
+  border-left: 3px solid #6366f1;
+}
+
+.holiday-date,
+.shift-date {
+  color: #64748b;
+  flex-shrink: 0;
+  width: 110px;
+}
+
+.holiday-name,
+.shift-primary {
+  flex: 1;
+  color: #1e293b;
+  font-weight: 500;
+}
+
+.holiday-type {
+  color: #94a3b8;
+  font-size: 11px;
+  text-transform: uppercase;
+  align-self: center;
+}
+
+.shift-secondary {
+  color: #64748b;
+  flex: 1;
+}
+
+.ml-info {
+  padding: 12px 14px;
+  background: #faf5ff;
+  border: 1px solid #e9d5ff;
+  border-radius: 8px;
+  color: #6b21a8;
+  font-size: 12.5px;
+}
+
+.ml-info h4 {
+  color: #6b21a8;
+  margin-top: 0;
+}
+
+.more-field {
+  padding: 6px 10px;
+  color: #94a3b8;
+  font-size: 11.5px;
+  text-align: center;
+  background: #f8fafc;
+}
+
+/* ============================================
+   Timeline 优化状态
+   ============================================ */
+.timeline-status {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.timeline-status.ok {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.timeline-status.default {
+  background: #f1f5f9;
+  color: #64748b;
+}
